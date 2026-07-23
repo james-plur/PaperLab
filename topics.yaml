@@ -43,9 +43,9 @@ mcp:
   sources: [arxiv, semantic, openalex, crossref, dblp]
   timeout_seconds: 120
 
-pdf_root: /Users/luchenda/papers/paperlab
-db_path: /Users/luchenda/papers/paperlab/data/papers.db
-site_dir: /Users/luchenda/papers/paperlab/site
+pdf_root: /Users/luchenda/tools/paperlab
+db_path: data/papers.db
+site_dir: site
 
 obsidian:
   enabled: false
