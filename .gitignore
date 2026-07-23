@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# venv / tooling
+.venv/
+.uv-cache/
+.DS_Store
+
+# runtime data (regenerate via paperlab update)
+site/
+site_smoke/
+
+# secrets
+.env
+
+# throwaway smoke config
+topics.smoke.yaml
+topics.kvcache.yaml
