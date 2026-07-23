@@ -584,7 +584,8 @@ def extract(store: Store, cfg: Config, topic: TopicConfig, *, log=print) -> int:
 
 
 def download_single(store: Store, cfg: Config, paper_id: str, *, log=print) -> int:
-    """Download a single paper PDF. Tries direct URL, arXiv term search, USENIX proceedings."""
+    """Download a single paper PDF using per-publisher strategies."""
+    from . import download as dl_mod
     row = store.conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
     if not row:
         log("  [pdf] paper not found: " + paper_id)
@@ -593,76 +594,15 @@ def download_single(store: Store, cfg: Config, paper_id: str, *, log=print) -> i
     if _valid_pdf(destination):
         store.set_pdf(row["id"], path=str(destination), status="ok")
         return 1
-    # 1. arXiv by known arxiv_id
-    if row["arxiv_id"]:
-        aid = row["arxiv_id"].strip()
-        if "/" in aid:
-            aid = aid.rsplit("/", 1)[-1]
-        url = "https://arxiv.org/pdf/" + aid + ".pdf"
-        try:
-            pdf_mod.download(url, destination)
-            if _valid_pdf(destination):
-                store.set_pdf(row["id"], path=str(destination), status="ok", pdf_url=url)
-                return 1
-        except Exception:
-            pass
-        import time as _t; _t.sleep(3)
-    # 2. Direct pdf_url
-    url = row["pdf_url"]
-    if url and "pdf" in url.lower():
-        try:
-            pdf_mod.download(url, destination)
-            if _valid_pdf(destination):
-                store.set_pdf(row["id"], path=str(destination), status="ok", pdf_url=url)
-                return 1
-        except Exception:
-            pass
-    # 3. arXiv term search (works for most system papers with preprints)
-    try:
-        from .sources.paper_search import title_similarity
-        from .http import fetch_text
-        import xml.etree.ElementTree as ET
-        import re as _re
-        from urllib.parse import quote
-        ATOM = "{http://www.w3.org/2005/Atom}"
-        words = [w.strip(".,;:!?\"'()[]{}") for w in row["title"].split() if len(w) > 2][:6]
-        query = " ".join(words)
-        arxiv_url = ("http://export.arxiv.org/api/query?search_query=all:" + quote(query)
-                     + "&start=0&max_results=5&sortBy=relevance")
-        raw = fetch_text(arxiv_url, max_time=30)
-        root = ET.fromstring(raw)
-        for entry in root.findall(ATOM + "entry"):
-            id_url = (entry.findtext(ATOM + "id") or "").strip()
-            m = _re.search(r"/abs/(\d{4}\.\d{4,5})", id_url)
-            aid = m.group(1) if m else None
-            et = " ".join((entry.findtext(ATOM + "title") or "").split())
-            if aid and title_similarity(row["title"], et) >= 0.85:
-                pdf_url = "https://arxiv.org/pdf/" + aid + ".pdf"
-                pdf_mod.download(pdf_url, destination)
-                if _valid_pdf(destination):
-                    store.set_enrichment(row["id"], {"arxiv_id": aid})
-                    store.set_pdf(row["id"], path=str(destination), status="ok", pdf_url=pdf_url)
-                    return 1
-                import time as _t; _t.sleep(3)
-    except Exception:
-        pass
-    # 4. USENIX proceedings (OSDI, NSDI, FAST)
-    venue = row["venue"] or ""
-    if venue in ("OSDI", "NSDI", "FAST") and row["year"]:
-        try:
-            from .http import fetch_text
-            yy = str(row["year"] % 100).zfill(2)
-            proc_url = "https://www.usenix.org/conference/" + venue.lower() + yy + "/technical-sessions"
-            html = fetch_text(proc_url, max_time=30, compressed=False)
-            for m in re.finditer(r'href="(/system/files/[^"]+\.pdf)"[^>]*>([^<]+)', html):
-                link_title = m.group(2).strip()
-                if title_similarity(row["title"], link_title) >= 0.7:
-                    pdf_url = "https://www.usenix.org" + m.group(1)
-                    pdf_mod.download(pdf_url, destination)
-                    if _valid_pdf(destination):
-                        store.set_pdf(row["id"], path=str(destination), status="ok", pdf_url=pdf_url)
-                        return 1
-        except Exception:
-            pass
-    log("  [pdf] all download methods failed for: " + row["title"])
+    paper = dict(row)
+    result = dl_mod.download_paper(paper, destination, log=log)
+    if result:
+        store.set_pdf(row["id"], path=str(destination), status="ok", pdf_url=result)
+        if result.startswith("https://arxiv.org/pdf/"):
+            aid = result.split("/pdf/")[1].replace(".pdf", "")
+            store.set_enrichment(row["id"], {"arxiv_id": aid})
+        return 1
+    store.conn.execute("UPDATE papers SET pdf_status='error' WHERE id=?", (paper_id,))
+    store.conn.commit()
     return 0
+

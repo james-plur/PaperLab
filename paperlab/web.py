@@ -251,10 +251,15 @@ class PaperHandler(BaseHTTPRequestHandler):
                                "application/json", 500)
             elif parsed.path in ("/", "/index.html"):
                 self._send(HTML.encode(), "text/html; charset=utf-8")
+            elif parsed.path == "/api/report":
+                import urllib.parse as ul
+                pid = ul.unquote(parse_qs(parsed.query).get("id", [""])[0])
+                self._serve_report(pid)
             else:
                 self._send(b"not found", "text/plain; charset=utf-8", 404)
         except Exception as exc:
             self._send(json.dumps({"error": str(exc)}).encode(), "application/json", 500)
+
 
     def _serve_pdf(self, pid):
         conn = _connect(self.db_path)
@@ -288,10 +293,13 @@ class PaperHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/edit":
                 result = update_paper(self.db_path, data.get("paper_id", ""), data.get("fields", {}))
                 self._send(json.dumps(result, ensure_ascii=False).encode(), "application/json; charset=utf-8")
+            elif parsed.path == "/api/report":
+                self._do_report(data.get("paper_id", ""))
             else:
                 self._send(b"not found", "text/plain; charset=utf-8", 404)
         except Exception as exc:
             self._send(json.dumps({"error": str(exc)}).encode(), "application/json", 500)
+
 
     def _do_download(self, pid):
         conn = _connect(self.db_path)
@@ -318,6 +326,61 @@ class PaperHandler(BaseHTTPRequestHandler):
                 self._send(json.dumps({"status": "ok", "url": "/pdf/" + pid}).encode(), "application/json")
             else:
                 self._send(json.dumps({"status": "failed"}).encode(), "application/json")
+        except Exception as exc:
+           self._send(json.dumps({"error": str(exc)}).encode(), "application/json", 500)
+
+    def _serve_report(self, paper_id):
+        """GET /api/report?id=...  -- return report markdown + status."""
+        conn = _connect(self.db_path)
+        try:
+            row = conn.execute(
+                "SELECT pdf_path FROM papers WHERE id=?", (paper_id,)).fetchone()
+            rpt = conn.execute(
+                "SELECT report_path,status,generated_at FROM paper_reports WHERE paper_id=?",
+                (paper_id,)).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            self._send(json.dumps({"error": "paper not found"}).encode(), "application/json", 404)
+            return
+        has_pdf = bool(row["pdf_path"]) and os.path.isfile(row["pdf_path"])
+        if not has_pdf:
+            self._send(json.dumps({"error": "PDF not downloaded; report requires the PDF"}).encode(),
+                       "application/json", 400)
+            return
+        if rpt and rpt["report_path"] and os.path.isfile(rpt["report_path"]):
+            content = open(rpt["report_path"], "r", encoding="utf-8").read()
+            self._send(json.dumps({"status": "ok", "content": content,
+                                   "path": rpt["report_path"]}).encode(),
+                       "application/json; charset=utf-8")
+            return
+        self._send(json.dumps({"status": "none"}).encode(), "application/json; charset=utf-8")
+
+    def _do_report(self, paper_id):
+        """POST /api/report  -- generate (or regenerate) the deep-read report."""
+        conn = _connect(self.db_path)
+        try:
+            row = conn.execute("SELECT pdf_path FROM papers WHERE id=?", (paper_id,)).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            self._send(json.dumps({"error": "paper not found"}).encode(), "application/json", 404)
+            return
+        if not row["pdf_path"] or not os.path.isfile(row["pdf_path"]):
+            self._send(json.dumps({"error": "PDF not downloaded; report requires the PDF"}).encode(),
+                       "application/json", 400)
+            return
+        try:
+            import sys
+            sys.path.insert(0, "/Users/luchenda/tools/paperlab")
+            from .config import load_config
+            from .store import Store
+            from . import report as report_mod
+            cfg = load_config("/Users/luchenda/tools/paperlab/topics.yaml")
+            with Store(str(self.db_path)) as store:
+                path = report_mod.generate_report(store, cfg, paper_id, log=lambda m: None)
+            self._send(json.dumps({"status": "ok", "path": path}).encode(),
+                       "application/json; charset=utf-8")
         except Exception as exc:
             self._send(json.dumps({"error": str(exc)}).encode(), "application/json", 500)
 
@@ -352,9 +415,10 @@ main{max-width:1500px;margin:16px auto;padding:0 20px}.paper{background:var(--ca
 .title{font-size:16px;font-weight:650}.meta,.authors,.orgs{color:var(--muted);margin-top:5px}.abstract{margin:10px 0 0;max-width:1200px}
 .chip{display:inline-block;background:#edf2f1;border-radius:12px;padding:2px 8px;margin-right:5px;font-size:12px}
 .kw-chip{background:#e8f0fe;color:#1a5276;cursor:pointer}.kw-chip:hover{background:#d0e0fc}
-a{color:var(--accent);text-decoration:none}.links a{margin-right:12px}.pager{display:flex;justify-content:center;align-items:center;gap:12px;margin:22px}.empty{text-align:center;color:var(--muted);padding:60px}
-.dl-btn{background:var(--accent);color:#fff;border:none;padding:4px 10px;border-radius:6px;font-size:13px;cursor:pointer}.dl-btn:hover{opacity:.85}.dl-btn:disabled{opacity:.5}
-.edit-btn{background:#6c757d;color:#fff;border:none;padding:4px 10px;border-radius:6px;font-size:13px;cursor:pointer;margin-left:8px}
+a{color:var(--accent);text-decoration:none}.pager{display:flex;justify-content:center;align-items:center;gap:12px;margin:22px}.empty{text-align:center;color:var(--muted);padding:60px}
+.link-btn{display:inline-block;background:#e9ecef;color:var(--ink);padding:4px 10px;border-radius:6px;font-size:13px;text-decoration:none;cursor:pointer;margin-left:6px}.link-btn:hover{background:#dee2e6}
+.dl-btn{background:var(--accent);color:#fff;border:none;padding:4px 10px;border-radius:6px;font-size:13px;cursor:pointer;margin-left:6px}.dl-btn:hover{opacity:.85}.dl-btn:disabled{opacity:.5}
+.edit-btn{background:#6c757d;color:#fff;border:none;padding:4px 10px;border-radius:6px;font-size:13px;cursor:pointer;margin-left:6px}
 .mode-btn{background:#e9ecef;border:none;padding:6px 14px;border-radius:8px;cursor:pointer;font-size:13px}.mode-btn.active{background:var(--accent);color:#fff}
 .modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.4);z-index:100}.modal-overlay.show{display:flex;justify-content:center;align-items:center}
 .modal{background:#fff;border-radius:12px;padding:24px;max-width:700px;width:90%;max-height:85vh;overflow-y:auto}
@@ -362,6 +426,11 @@ a{color:var(--accent);text-decoration:none}.links a{margin-right:12px}.pager{dis
 .modal input,.modal textarea{width:100%;margin-bottom:8px}.modal-actions{display:flex;gap:10px;margin-top:16px;justify-content:flex-end}
 .btn-save{background:var(--accent);color:#fff;border:none;padding:8px 20px;border-radius:8px;cursor:pointer}.btn-cancel{background:#e9ecef;border:none;padding:8px 20px;border-radius:8px;cursor:pointer}
 .kw-edit-input{font-size:12px;padding:2px 6px;border:1px solid var(--accent);border-radius:4px;width:100%}
+.report-btn{background:#2e4a8b;color:#fff;border:none;padding:4px 10px;border-radius:6px;font-size:13px;cursor:pointer;margin-left:6px}.report-btn:hover{opacity:.85}.report-btn:disabled{opacity:.4}
+.report-modal{background:#fff;border-radius:12px;padding:28px;max-width:900px;width:92%;max-height:88vh;overflow-y:auto;line-height:1.7}
+.report-modal h1{font-size:20px;margin:0 0 4px}.report-modal h2{font-size:17px;margin:18px 0 8px;color:#176b5b}.report-modal h3{font-size:15px;margin:14px 0 6px}
+.report-modal p,.report-modal li{font-size:14px;margin:6px 0}.report-modal code{background:#f0f0f0;padding:1px 4px;border-radius:3px;font-size:13px}.report-modal pre{background:#f6f8fa;padding:12px;border-radius:8px;overflow-x:auto}
+.report-modal .modal-actions{margin-top:20px}
 </style></head><body>
 <header><div class="bar"><h1>PaperLab</h1>
 <input id="q" placeholder="Search: title, author, abstract, keywords... (Enter for semantic search)">
@@ -392,6 +461,15 @@ a{color:var(--accent);text-decoration:none}.links a{margin-right:12px}.pager{dis
 </div>
 </div>
 </div>
+<div class="modal-overlay" id="reportModal">
+<div class="modal report-modal">
+<div id="reportLoading" style="text-align:center;padding:40px;color:var(--muted)">Generating report, please wait...</div>
+<div id="reportContent" style="display:none"></div>
+<div class="modal-actions">
+<button class="btn-cancel" onclick="closeReport()">Close</button>
+</div>
+</div>
+</div>
 <script>
 const S={page:1,pages:1,mode:"keyword"};
 const $=id=>document.getElementById(id);
@@ -404,15 +482,17 @@ async function facets(){
 }
 function links(p){
   let r=[];
-  if(p.pdf_path) r.push('<a target="_blank" href="/pdf/'+encodeURIComponent(p.id)+'">PDF</a>');
-  if(p.source_url) r.push('<a target="_blank" href="'+esc(p.source_url)+'">Landing</a>');
-  if(p.doi) r.push('<a target="_blank" href="https://doi.org/'+esc(p.doi)+'">DOI</a>');
-  if(p.arxiv_id) r.push('<a target="_blank" href="https://arxiv.org/abs/'+esc(p.arxiv_id)+'">arXiv</a>');
+  if(p.source_url) r.push('<a class="link-btn" target="_blank" href="'+esc(p.source_url)+'">Link</a>');
+  if(p.arxiv_id) r.push('<a class="link-btn" target="_blank" href="https://arxiv.org/abs/'+esc(p.arxiv_id)+'">arXiv</a>');
   return r.join(" ");
 }
 function dlButton(p){
   if(p.pdf_path) return '<button class="dl-btn" onclick="openPDF(\''+p.id+'\')">Open PDF</button>';
   return '<button class="dl-btn" onclick="downloadPaper(\''+p.id+'\',this)">Download</button>';
+}
+function reportButton(p){
+  if(!p.pdf_path) return '<button class="report-btn" disabled title="PDF required">Report</button>';
+  return '<button class="report-btn" onclick="openReport(\''+p.id+'\')">Report</button>';
 }
 function openPDF(id){window.open("/pdf/"+encodeURIComponent(id),"_blank");}
 async function downloadPaper(id,btn){
@@ -460,16 +540,76 @@ function kwChips(p){
     return '<span class="chip kw-chip" title="Click to edit keywords" onclick=\'editPaper('+JSON.stringify(p)+')\'>'+esc(k)+'</span>';
   }).join(" ");
 }
+function renderMarkdown(md){
+  let h=esc(md);
+  h=h.replace(/^### (.+)$/gm,'<h3>$1</h3>');
+  h=h.replace(/^## (.+)$/gm,'<h2>$1</h2>');
+  h=h.replace(/^# (.+)$/gm,'<h1>$1</h1>');
+  h=h.replace(/```([\s\S]*?)```/g,'<pre><code>$1</code></pre>');
+  h=h.replace(/`([^`]+)`/g,'<code>$1</code>');
+  h=h.replace(/^\- (.+)$/gm,'<li>$1</li>');
+  h=h.replace(/^\d+\. (.+)$/gm,'<li>$1</li>');
+  h=h.replace(/(<li>[\s\S]*?<\/li>)/g,'<ul>$1</ul>');
+  h=h.replace(/<\/ul>\s*<ul>/g,'');
+  h=h.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>');
+  h=h.replace(/([^<>\n])\n\n/g,'$1</p><p>');
+  h='<p>'+h+'</p>';
+  return h.replace(/<p>\s*<(h[123]|ul|pre)/g,'<$1').replace(/<\/(h[123]|ul|pre)>\s*<\/p>/g,'</$1>');
+}
+async function openReport(id){
+  $("reportLoading").style.display="block";
+  $("reportContent").style.display="none";
+  $("reportModal").classList.add("show");
+  try{
+    const r=await fetch("/api/report?id="+encodeURIComponent(id));
+    const d=await r.json();
+    if(d.status==="ok"&&d.content){
+      $("reportContent").innerHTML=renderMarkdown(d.content);
+      $("reportLoading").style.display="none";
+      $("reportContent").style.display="block";
+    }else if(d.status==="none"){
+      await generateReport(id);
+    }else{
+      $("reportLoading").textContent=d.error||"Report unavailable (PDF required)";
+    }
+  }catch(e){
+    $("reportLoading").textContent="Error: "+e;
+  }
+}
+async function generateReport(id){
+  $("reportLoading").style.display="block";
+  $("reportLoading").textContent="Generating report, please wait...";
+  $("reportContent").style.display="none";
+  try{
+    const r=await fetch("/api/report",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({paper_id:id})});
+    const d=await r.json();
+    if(d.status==="ok"){
+      const r2=await fetch("/api/report?id="+encodeURIComponent(id));
+      const d2=await r2.json();
+      if(d2.status==="ok"&&d2.content){
+        $("reportContent").innerHTML=renderMarkdown(d2.content);
+        $("reportLoading").style.display="none";
+        $("reportContent").style.display="block";
+      }else{
+        $("reportLoading").textContent="Report generated but could not be loaded.";
+      }
+    }else{
+      $("reportLoading").textContent=d.error||"Generation failed";
+    }
+  }catch(e){
+    $("reportLoading").textContent="Error: "+e;
+  }
+}
+function closeReport(){$("reportModal").classList.remove("show");}
 function card(p){
   const m=(p.venue_memberships||(p.venue||"")+" "+(p.year||"")).split("|").filter(Boolean).map(x=>'<span class="chip">'+esc(x)+'</span>').join("");
-  const tp=(p.topics||"").split("|").filter(Boolean).map(x=>'<span class="chip">'+esc(x)+'</span>').join(" ");
   let html='<article class="paper"><div class="title">'+esc(p.title)+'</div>';
-  html+='<div class="meta">'+m+" "+kwChips(p)+" "+tp+'</div>';
+  html+='<div class="meta">'+m+" "+kwChips(p)+'</div>';
   html+='<div class="authors">'+esc(p.authors||"")+'</div>';
   if(p.organizations) html+='<div class="orgs">'+esc(p.organizations)+'</div>';
   if(p.abstract) html+='<details><summary>Abstract</summary><div class="abstract">'+esc(p.abstract)+'</div></details>';
-  html+='<div class="links">'+links(p)+" "+dlButton(p)+'<button class="edit-btn" onclick=\'editPaper('+JSON.stringify(p)+')\'>Edit</button></div></article>';
-  return html;
+ html+='<div class="links">'+links(p)+" "+dlButton(p)+" "+reportButton(p)+'<button class="edit-btn" onclick=\'editPaper('+JSON.stringify(p)+')\'>Edit</button></div></article>';
+ return html;
 }
 async function load(reset){
   if(reset)S.page=1;
@@ -502,5 +642,6 @@ $("q").addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();sem
 $("prev").onclick=()=>{S.page--;load();};
 $("next").onclick=()=>{S.page++;load();};
 $("editModal").addEventListener("click",e=>{if(e.target===$("editModal"))closeModal();});
+$("reportModal").addEventListener("click",e=>{if(e.target===$("reportModal"))closeReport();});
 facets().then(()=>load());
 </script></body></html>"""

@@ -189,6 +189,38 @@ def cmd_download(args, cfg: Config, store: Store) -> None:
     _log(f"Download {'succeeded' if count else 'failed'}")
 
 
+def cmd_report(args, cfg: Config, store: Store) -> None:
+    """Generate (or force-regenerate) a deep-read report for a paper."""
+    from . import report as report_mod
+    paper_ref = args.paper
+    row = store.conn.execute("SELECT * FROM papers WHERE id=?", (paper_ref,)).fetchone()
+    if not row:
+        row = store.conn.execute(
+            "SELECT * FROM papers WHERE arxiv_id=?", (paper_ref,)).fetchone()
+    if not row:
+        rows = store.conn.execute(
+            "SELECT * FROM papers WHERE lower(title) LIKE ?",
+            (f"%{paper_ref.lower()}%",)).fetchall()
+        if len(rows) == 1:
+            row = rows[0]
+        elif len(rows) > 1:
+            _log(f"Multiple papers match '{paper_ref}':")
+            for i, r in enumerate(rows[:10]):
+                _log(f"  [{i}] {r['venue']} {r['year']} {r['title']}")
+            return
+    if not row:
+        _log(f"Paper not found: {paper_ref}")
+        return
+    existing = store.get_report(row["id"])
+    if existing and not args.force:
+        _log(f"Report already exists: {existing['report_path']}")
+        _log("Use --force to regenerate.")
+        return
+    _log(f"Generating report: {row['title']}")
+    path = report_mod.generate_report(store, cfg, row["id"], log=_log)
+    _log(f"Report saved: {path}")
+
+
 # === Other commands ===
 def cmd_enrich(args, cfg: Config, store: Store) -> None:
     bulk = pipeline.enrich_openalex_dois(
@@ -290,6 +322,13 @@ def build_parser() -> argparse.ArgumentParser:
     download = sub.add_parser("download", help="download a paper PDF by id/title/arxiv_id")
     download.add_argument("paper", help="paper id, arxiv_id, or title substring")
     download.set_defaults(func=cmd_download)
+    
+
+    # report
+    report = sub.add_parser("report", help="generate a deep-read report for a paper")
+    report.add_argument("paper", help="paper id, arxiv_id, or title substring")
+    report.add_argument("--force", action="store_true", help="regenerate even if report exists")
+    report.set_defaults(func=cmd_report)
 
     # enrich
     enrich = sub.add_parser("enrich", help="fill abstracts and metadata")

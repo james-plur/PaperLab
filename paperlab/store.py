@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def normalize_title(title: str) -> str:
@@ -141,6 +141,13 @@ CREATE INDEX IF NOT EXISTS idx_papers_thash ON papers(norm_title_hash);
 CREATE INDEX IF NOT EXISTS idx_topic_relevant ON paper_topics(topic_id, relevant, score);
 CREATE INDEX IF NOT EXISTS idx_source_lookup ON paper_sources(source, source_id);
 CREATE INDEX IF NOT EXISTS idx_paper_venue_membership ON paper_venues(venue, year, paper_id);
+CREATE TABLE IF NOT EXISTS paper_reports (
+  paper_id TEXT PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,
+  report_path TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'ok',
+  generated_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
 """
 
 _V2_COLUMNS = {
@@ -634,3 +641,21 @@ class Store:
             "downloaded": sum(1 for row in rows if row["pdf_status"] == "ok"),
             "extracted": sum(1 for row in rows if row["extraction_version"] is not None),
         }
+
+    def get_report(self, paper_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM paper_reports WHERE paper_id=?", (paper_id,)).fetchone()
+
+    def set_report(self, paper_id: str, *, report_path: str, status: str = "ok",
+                   commit: bool = True) -> None:
+        now = time.time()
+        self.conn.execute(
+            """INSERT INTO paper_reports (paper_id,report_path,status,generated_at,updated_at)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(paper_id) DO UPDATE SET
+                 report_path=excluded.report_path,status=excluded.status,
+                 updated_at=excluded.updated_at""",
+            (paper_id, str(report_path), status, now, now),
+        )
+        if commit:
+            self.conn.commit()
