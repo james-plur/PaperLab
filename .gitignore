@@ -11,13 +11,27 @@ dist/
 .uv-cache/
 .DS_Store
 
-# runtime data (regenerate via paperlab update)
+# runtime data (synchronized through `paperlab sync`)
+data/*
+!data/.gitkeep
+pdfs/*
+!pdfs/.gitkeep
+reports/*
+!reports/.gitkeep
+logs/
 site/
 site_smoke/
 
 # secrets
 .env
+data/llm_config.json
+.publish/
+data/publish-state.json
+data/sync-state.json
+*.sync-tmp
+*.bundle
 
-# throwaway smoke config
+# local topic config (start from topics.example.yaml)
+topics.yaml
 topics.smoke.yaml
 topics.kvcache.yaml

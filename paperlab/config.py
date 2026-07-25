@@ -186,7 +186,12 @@ def load_config(path: str | Path = "topics.yaml") -> Config:
     default_years = list(defaults.get("year_range") or _default_year_range())
     default_citations = int(defaults.get("citation_threshold", 0))
     default_threshold = float(defaults.get("relevance_threshold", 0.5))
-    papers_root = Path(raw.get("pdf_root") or (Path.home() / "papers/paperlab")).expanduser().resolve()
+    pdf_root_raw = raw.get("pdf_root")
+    if pdf_root_raw:
+        candidate = Path(pdf_root_raw).expanduser()
+        papers_root = (candidate if candidate.is_absolute() else root / candidate).resolve()
+    else:
+        papers_root = (Path.home() / "papers/paperlab").resolve()
 
     topic_items = raw.get("topics")
     # A config without topics receives the four agreed defaults.  Existing v1

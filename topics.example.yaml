@@ -1,0 +1,47 @@
+# Portable PaperLab configuration. Relative paths resolve from this file.
+defaults:
+  year_range: [2022, 2027]
+  citation_threshold: 0
+  relevance_threshold: 0.5
+
+catalog:
+  year_range: [2022, 2027]
+  incremental_lookback_years: 1
+  venues:
+    - NEURIPS
+    - ICML
+    - ICLR
+    - AAAI
+    - IJCAI
+    - KDD
+    - MLSYS
+    - ACL
+    - EMNLP
+    - NAACL
+    - CVPR
+    - ICCV
+    - ECCV
+    - ISCA
+    - MICRO
+    - HPCA
+    - ASPLOS
+    - SIGCOMM
+    - NSDI
+    - INFOCOM
+    - FAST
+    - OSDI
+    - SOSP
+
+mcp:
+  command: uvx
+  args: [paper-search-mcp]
+  sources: [arxiv, semantic, openalex, crossref, dblp]
+  timeout_seconds: 120
+
+pdf_root: .
+db_path: data/papers.db
+
+schedule:
+  weekday: 1
+  hour: 9
+  minute: 0

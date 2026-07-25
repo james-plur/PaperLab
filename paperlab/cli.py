@@ -274,7 +274,7 @@ def cmd_web(args, cfg: Config, store: Store) -> None:
     elif args.action == "status":
         _log(json.dumps(schedule_mod.web_status(), ensure_ascii=False))
     else:
-        web_mod.serve(cfg.db_path, host=args.host, port=args.port)
+        web_mod.serve(cfg.db_path, host=args.host, port=args.port, config_path=args.config)
 
 
 def cmd_stats(args, cfg: Config, store: Store) -> None:
@@ -300,11 +300,31 @@ def cmd_schedule(args, cfg: Config, store: Store) -> None:
         _log(json.dumps(schedule_mod.status(), ensure_ascii=False))
 
 
+def cmd_publish(args, cfg: Config, store: Store) -> None:
+    from .publish import publish
+    result = publish(store, cfg, args.public_repo, limit=args.limit,
+                     dry_run=args.dry_run, log=_log)
+    _log(json.dumps(result, ensure_ascii=False))
+
+
+def cmd_sync(args, cfg: Config, store: Store | None) -> None:
+    from . import sync as sync_mod
+    if args.action == "status":
+        sync_mod.status(cfg, log=_log)
+    elif args.action == "push":
+        sync_mod.push(cfg, dry_run=args.dry_run, force=args.force, log=_log)
+    elif args.action == "pull":
+        sync_mod.pull(cfg, include_pdfs=args.all, force=args.force, log=_log)
+    elif args.action == "gc":
+        sync_mod.garbage_collect(cfg, apply=args.apply, log=_log)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="paperlab", description="AI conference paper database")
-    parser.add_argument("--config", "-c", default="topics.yaml", help="path to config file")
+    _default_config = str(Path(__file__).resolve().parent.parent / "topics.yaml")
+    parser.add_argument("--config", "-c", default=_default_config, help="path to config file")
     parser.add_argument("--db", default=None, help="override SQLite path")
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub = parser.add_subparsers(dest="cmd", required=False)
 
     # 1. update
     update = sub.add_parser("update", help="incrementally catalogue recent AI conference papers")
@@ -376,6 +396,28 @@ def build_parser() -> argparse.ArgumentParser:
     schedule.add_argument("action", choices=("install", "status", "remove"))
     schedule.set_defaults(func=cmd_schedule)
 
+    publish_p = sub.add_parser("publish", help="publish public data and reports to Cloudflare")
+    publish_p.add_argument("--public-repo", default=str(Path(__file__).resolve().parent.parent / ".publish/AITopPaperLab"))
+    publish_p.add_argument("--limit", type=int, default=40000)
+    publish_p.add_argument("--dry-run", action="store_true")
+    publish_p.set_defaults(func=cmd_publish)
+
+    sync_p = sub.add_parser("sync", help="synchronize runtime data with private S3/R2 storage")
+    sync_sub = sync_p.add_subparsers(dest="sync_action", required=True)
+    sync_status = sync_sub.add_parser("status", help="compare local and remote revisions")
+    sync_status.set_defaults(func=cmd_sync, action="status")
+    sync_push = sync_sub.add_parser("push", help="upload a consistent database snapshot and changed files")
+    sync_push.add_argument("--dry-run", action="store_true")
+    sync_push.add_argument("--force", action="store_true", help="replace an unrelated remote revision")
+    sync_push.set_defaults(func=cmd_sync, action="push")
+    sync_pull = sync_sub.add_parser("pull", help="restore the latest database, reports and reviews")
+    sync_pull.add_argument("--all", action="store_true", help="also download all PDFs")
+    sync_pull.add_argument("--force", action="store_true", help="replace an unlinked local database after backup")
+    sync_pull.set_defaults(func=cmd_sync, action="pull")
+    sync_gc = sync_sub.add_parser("gc", help="find unreferenced remote content objects")
+    sync_gc.add_argument("--apply", action="store_true", help="delete unreferenced objects")
+    sync_gc.set_defaults(func=cmd_sync, action="gc")
+
     return parser
 
 
@@ -386,6 +428,13 @@ def main(argv=None) -> int:
     _load_env(config_file.parent / ".env")
     cfg = load_config(args.config)
     db_path = args.db or str(cfg.db_path)
+    if not args.cmd:
+        # No subcommand: default to serving the web UI
+        web_mod.serve(cfg.db_path, host="127.0.0.1", port=8765, config_path=args.config)
+        return 0
+    if args.cmd == "sync":
+        args.func(args, cfg, None)
+        return 0
     if args.cmd in ("web", "schedule") and getattr(args, "action", "") in {"install", "status", "remove"}:
         args.func(args, cfg, None)
         return 0

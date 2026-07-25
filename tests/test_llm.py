@@ -1,5 +1,9 @@
 import unittest
 from unittest import mock
+import json
+import os
+import tempfile
+from pathlib import Path
 
 from paperlab import relevance
 
@@ -17,6 +21,42 @@ class TestParseJson(unittest.TestCase):
         from paperlab.llm import _parse_json
         self.assertEqual(_parse_json('here you go: {"a": 1} thanks'),
                          {"a": 1})
+
+
+class TestProviderConfig(unittest.TestCase):
+    def test_zhipu_defaults_and_secret_is_not_returned(self):
+        from paperlab.llm import public_provider_config, save_provider_config
+        with tempfile.TemporaryDirectory() as temp:
+            db = Path(temp) / "papers.db"
+            initial = public_provider_config(db)
+            self.assertEqual(initial["active_provider"], "zhipu")
+            self.assertEqual(initial["providers"]["zhipu"]["model"], "glm-5.2")
+            result = save_provider_config(db, {
+                "active_provider": "zhipu",
+                "providers": {"zhipu": {
+                    "model": "glm-test", "base_url": "https://example.test/v1",
+                    "api_key": "secret-value",
+                }},
+            })
+            self.assertTrue(result["providers"]["zhipu"]["has_api_key"])
+            self.assertNotIn("api_key", result["providers"]["zhipu"])
+            stored = json.loads((Path(temp) / "llm_config.json").read_text())
+            self.assertEqual(stored["providers"]["zhipu"]["api_key"], "secret-value")
+            self.assertEqual(os.stat(Path(temp) / "llm_config.json").st_mode & 0o777, 0o600)
+
+    def test_legacy_config_migrates_to_zhipu_and_cc_switch(self):
+        from paperlab.llm import public_provider_config
+        with tempfile.TemporaryDirectory() as temp:
+            db = Path(temp) / "papers.db"
+            (Path(temp) / "llm_config.json").write_text(json.dumps({
+                "active_provider": "codex",
+                "providers": {"gemini": {"api_key": "old-google-key"},
+                              "codex": {"model": "proxy-model"}},
+            }))
+            result = public_provider_config(db)
+            self.assertEqual(result["active_provider"], "zhipu")
+            self.assertNotIn("gemini", result["providers"])
+            self.assertEqual(result["providers"]["cc_switch"]["model"], "proxy-model")
 
 
 class TestRelevance(unittest.TestCase):

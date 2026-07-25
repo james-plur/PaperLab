@@ -1,7 +1,8 @@
 """LLM helpers: keyword extraction, semantic search, and JSON chat.
 
 Supports two backends:
-- cc-switch local proxy at http://127.0.0.1:15721/v1 (Responses API wire)
+- Zhipu GLM through its OpenAI-compatible API
+- cc-switch local proxy at http://127.0.0.1:15721/v1
 - Standard OpenAI-compatible chat completions API
 """
 from __future__ import annotations
@@ -10,36 +11,169 @@ import json
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any
 
 
+PROVIDER_DEFAULTS = {
+    "zhipu": {
+        "label": "Zhipu GLM",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4/",
+        "model": "glm-5.2",
+        "api_key_env": "ZAI_API_KEY",
+    },
+    "cc_switch": {
+        "label": "CC Switch",
+        "base_url": "http://127.0.0.1:15721/v1",
+        "model": "zai-org/GLM-5.2",
+        "api_key_env": "OPENAI_API_KEY",
+    },
+}
+
+
+def config_path(db_path=None) -> Path:
+    override = os.environ.get("PAPERLAB_LLM_CONFIG")
+    if override:
+        return Path(override).expanduser()
+    if db_path:
+        return Path(db_path).expanduser().resolve().parent / "llm_config.json"
+    return Path(__file__).resolve().parent.parent / "data" / "llm_config.json"
+
+
+def load_provider_config(db_path=None) -> dict:
+    path = config_path(db_path)
+    saved = {}
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        pass
+    if not isinstance(saved, dict):
+        saved = {}
+    providers = {}
+    saved_providers = saved.get("providers")
+    if not isinstance(saved_providers, dict):
+        saved_providers = {}
+    for name, defaults in PROVIDER_DEFAULTS.items():
+        values = dict(defaults)
+        saved_name = "codex" if name == "cc_switch" and "cc_switch" not in saved_providers else name
+        if isinstance(saved_providers, dict) and isinstance(saved_providers.get(saved_name), dict):
+            values.update({k: v for k, v in saved_providers[saved_name].items()
+                           if k in {"base_url", "model", "api_key"} and isinstance(v, str)})
+        providers[name] = values
+    # Old Gemini/Codex configurations migrate once to the new Zhipu default.
+    active = saved.get("active_provider", "zhipu") if saved.get("schema_version") == 2 else "zhipu"
+    if active not in providers:
+        active = "zhipu"
+    return {"active_provider": active, "providers": providers}
+
+
+def public_provider_config(db_path=None) -> dict:
+    cfg = load_provider_config(db_path)
+    public = {"active_provider": cfg["active_provider"], "providers": {}}
+    for name, values in cfg["providers"].items():
+        env_key = os.environ.get(values["api_key_env"], "")
+        public["providers"][name] = {
+            "label": values["label"],
+            "base_url": values["base_url"],
+            "model": values["model"],
+            "has_api_key": bool(values.get("api_key") or env_key or name == "cc_switch"),
+        }
+    return public
+
+
+def save_provider_config(db_path, payload: dict) -> dict:
+    current = load_provider_config(db_path)
+    active = str(payload.get("active_provider") or current["active_provider"])
+    if active not in PROVIDER_DEFAULTS:
+        raise ValueError("unsupported LLM provider: " + active)
+    incoming = payload.get("providers") or {}
+    stored = {"schema_version": 2, "active_provider": active, "providers": {}}
+    for name in PROVIDER_DEFAULTS:
+        values = current["providers"][name]
+        update = incoming.get(name) if isinstance(incoming, dict) else None
+        if isinstance(update, dict):
+            for field in ("base_url", "model"):
+                if field in update:
+                    value = str(update[field]).strip()
+                    if not value:
+                        raise ValueError(f"{name}.{field} cannot be empty")
+                    values[field] = value
+            api_key = str(update.get("api_key") or "").strip()
+            if api_key:
+                values["api_key"] = api_key
+            if update.get("clear_api_key"):
+                values.pop("api_key", None)
+        stored["providers"][name] = {
+            key: values[key] for key in ("base_url", "model", "api_key") if values.get(key)
+        }
+    path = config_path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(stored, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(temp, 0o600)
+    temp.replace(path)
+    return public_provider_config(db_path)
+
+
+def _provider(provider=None, db_path=None, model=None):
+    cfg = load_provider_config(db_path)
+    name = provider or cfg["active_provider"]
+    if name not in cfg["providers"]:
+        raise ValueError("unsupported LLM provider: " + str(name))
+    values = dict(cfg["providers"][name])
+    values["name"] = name
+    if model:
+        values["model"] = model
+    if name == "cc_switch":
+        values["base_url"] = os.environ.get("OPENAI_BASE_URL", values["base_url"])
+        values["model"] = os.environ.get("PAPERLAB_MODEL", values["model"])
+    elif name == "zhipu":
+        values["base_url"] = os.environ.get("ZAI_BASE_URL", values["base_url"])
+        values["model"] = os.environ.get("ZAI_MODEL", values["model"])
+    values["api_key"] = (values.get("api_key") or
+                         os.environ.get(values["api_key_env"], "") or
+                         ("cc-switch" if name == "cc_switch" else ""))
+    if not values["api_key"]:
+        raise RuntimeError(f"{values['label']} API key is not configured")
+    return values
+
+
 def _get_base_url():
-    env_url = os.environ.get("OPENAI_BASE_URL", "")
+    env_url = os.environ.get("ZAI_BASE_URL", "")
     if env_url:
         return env_url
-    return "http://127.0.0.1:15721/v1"
+    return "https://open.bigmodel.cn/api/paas/v4/"
 
 
 def _get_api_key():
-    return os.environ.get("OPENAI_API_KEY", "cc-switch")
+    return os.environ.get("ZAI_API_KEY", "")
 
 
 def _get_model():
-    return os.environ.get("PAPERLAB_MODEL", "zai-org/GLM-5.2")
+    return os.environ.get("ZAI_MODEL", "glm-5.2")
 
 
-def _client():
+def _client(*, provider=None, db_path=None, model=None):
     from openai import OpenAI
-    return OpenAI(base_url=_get_base_url(), api_key=_get_api_key())
+    selected = _provider(provider, db_path, model)
+    return OpenAI(base_url=selected["base_url"], api_key=selected["api_key"]), selected
 
 
-def get_model():
-    return _get_model()
+def get_model(provider=None, db_path=None):
+    cfg = load_provider_config(db_path)
+    name = provider or cfg["active_provider"]
+    if name not in cfg["providers"]:
+        raise ValueError("unsupported LLM provider: " + str(name))
+    model = cfg["providers"][name]["model"]
+    if name == "cc_switch":
+        return os.environ.get("PAPERLAB_MODEL", model)
+    return os.environ.get("ZAI_MODEL", model) if name == "zhipu" else model
 
 
-def chat_json(system, user, *, model=None, retries=2, temperature=0.2):
-    model = model or _get_model()
-    client = _client()
+def chat_json(system, user, *, model=None, provider=None, db_path=None,
+              retries=2, temperature=0.2):
+    client, selected = _client(provider=provider, db_path=db_path, model=model)
+    model = selected["model"]
     last_err = "unknown"
     use_json_mode = True
     for attempt in range(retries + 1):
@@ -74,9 +208,10 @@ def chat_json(system, user, *, model=None, retries=2, temperature=0.2):
     raise RuntimeError("LLM JSON call failed (" + model + "): " + last_err)
 
 
-def chat_text(system, user, *, model=None, retries=2, temperature=0.3):
-    model = model or _get_model()
-    client = _client()
+def chat_text(system, user, *, model=None, provider=None, db_path=None,
+              retries=2, temperature=0.3):
+    client, selected = _client(provider=provider, db_path=db_path, model=model)
+    model = selected["model"]
     last_err = "unknown"
     for attempt in range(retries + 1):
         try:

@@ -15,6 +15,12 @@ dependencies = [
   "jinja2>=3.1",
 ]
 
+[project.optional-dependencies]
+sync = [
+  "boto3>=1.35",
+  "zstandard>=0.23",
+]
+
 [project.scripts]
 paperlab = "paperlab.cli:main"
 

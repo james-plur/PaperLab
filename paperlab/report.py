@@ -5,11 +5,12 @@ users can edit it freely; the database only stores the path and status.
 """
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from . import pdf as pdf_mod
 from . import figure as figure_mod
-from .llm import chat_text, get_model
+from .llm import chat_text
 
 _SYS = (
     "You are a senior research scientist writing a thorough deep-read report of an "
@@ -50,7 +51,7 @@ def _figures_dir_for(cfg, paper_id: str) -> Path:
     return (cfg.pdf_root / "reports" / "figures" / _slug(paper_id)).resolve()
 
 
-def generate_report(store, cfg, paper_id: str, *, log=print) -> str:
+def generate_report(store, cfg, paper_id: str, *, provider=None, model=None, log=print) -> str:
     """Generate (or regenerate) the deep-read report for one paper.
 
     Returns the absolute path of the report Markdown file.  Requires that the
@@ -105,11 +106,83 @@ def generate_report(store, cfg, paper_id: str, *, log=print) -> str:
         f"Full paper text:\n{full_text}"
         f"{figure_info}"
     )
-    markdown = chat_text(_SYS, user, model=get_model())
+    markdown = chat_text(
+        _SYS, user, provider=provider, model=model, db_path=cfg.db_path)
 
     dest = report_path_for(cfg, paper_id)
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(markdown, encoding="utf-8")
     store.set_report(paper_id, report_path=str(dest), status="ok")
     log(f"  [report] {paper_id}: written -> {dest}")
+    return str(dest)
+
+
+_TOPIC_REVIEW_SYS = """You are a senior research scientist writing a Chinese literature review.
+Use only the supplied paper metadata and deep-read reports. Do not invent facts.
+Start with a top-level heading containing the topic name. Then write:
+## 核心问题: identify and explain the central research problems shared by these papers.
+## 发展脉络: organize the evolution around those core problems, chronologically. Every
+development node must be one supplied paper and state its title, year, problem addressed,
+core method, advance over earlier work, and limitations. Explicitly connect adjacent nodes.
+## 综合观察: summarize converging ideas, disagreements, gaps, and promising directions.
+Every supplied paper must appear as a development node. Output pure Markdown."""
+
+
+def topic_snapshot_hash(paper_ids: list[str]) -> str:
+    return hashlib.sha256("\n".join(paper_ids).encode("utf-8")).hexdigest()
+
+
+def topic_review_path_for(cfg, topic_id: int) -> Path:
+    return (cfg.pdf_root / "reports" / "topics" / f"{topic_id}.md").resolve()
+
+
+def generate_topic_review(store, cfg, topic_id: int, *, provider=None, model=None,
+                          log=print) -> str:
+    """Generate a persisted review only when every member report already exists."""
+
+    topic = store.get_collection_topic(topic_id)
+    if topic is None:
+        raise RuntimeError("topic not found")
+    papers = list(store.collection_papers(topic_id))
+    if not papers:
+        raise ValueError("topic has no papers")
+    paper_ids = [row["id"] for row in papers]
+    snapshot = topic_snapshot_hash(paper_ids)
+    total = len(papers)
+    report_inputs = []
+    missing = []
+    for index, paper in enumerate(papers):
+        paper_id = paper["id"]
+        existing = store.get_report(paper_id)
+        report_path = Path(existing["report_path"]) if existing and existing["report_path"] else None
+        if not existing or existing["status"] != "ok" or not report_path or not report_path.is_file():
+            missing.append(paper["title"])
+            continue
+        report_inputs.append(
+            f"## Paper {index + 1}\nTitle: {paper['title']}\nYear: {paper['year'] or 'unknown'}\n"
+            f"Authors: {paper['authors'] or ''}\nVenue: {paper['venue'] or ''}\n\n"
+            f"Deep-read report:\n{report_path.read_text(encoding='utf-8')}"
+        )
+    if missing:
+        names = "; ".join(missing[:10])
+        if len(missing) > 10:
+            names += f"; and {len(missing) - 10} more"
+        raise ValueError(f"missing reports for {len(missing)} paper(s): {names}")
+
+    store.set_topic_review(topic_id, status="running", stage="generating review",
+                           completed_papers=total, total_papers=total, snapshot_hash=snapshot)
+    user = f"Topic: {topic['name']}\n\n" + "\n\n---\n\n".join(report_inputs)
+    markdown = chat_text(
+        _TOPIC_REVIEW_SYS, user, provider=provider, model=model, db_path=cfg.db_path)
+    dest = topic_review_path_for(cfg, topic_id)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(markdown, encoding="utf-8")
+
+    current_ids = [row["id"] for row in store.collection_papers(topic_id)]
+    current_hash = topic_snapshot_hash(current_ids)
+    final_status = "ok" if current_hash == snapshot else "stale"
+    final_stage = "complete" if final_status == "ok" else "membership changed; regenerate"
+    store.set_topic_review(
+        topic_id, status=final_status, stage=final_stage, completed_papers=total,
+        total_papers=total, review_path=str(dest), snapshot_hash=snapshot, generated=True)
     return str(dest)

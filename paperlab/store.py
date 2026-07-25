@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 
 
 def normalize_title(title: str) -> str:
@@ -148,6 +148,32 @@ CREATE TABLE IF NOT EXISTS paper_reports (
   generated_at REAL NOT NULL,
   updated_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS collection_topics (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS collection_topic_papers (
+  topic_id INTEGER NOT NULL REFERENCES collection_topics(id) ON DELETE CASCADE,
+  paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+  added_at REAL NOT NULL,
+  PRIMARY KEY (topic_id, paper_id)
+);
+CREATE TABLE IF NOT EXISTS topic_reviews (
+  topic_id INTEGER PRIMARY KEY REFERENCES collection_topics(id) ON DELETE CASCADE,
+  review_path TEXT,
+  status TEXT NOT NULL DEFAULT 'none',
+  stage TEXT,
+  completed_papers INTEGER NOT NULL DEFAULT 0,
+  total_papers INTEGER NOT NULL DEFAULT 0,
+  error TEXT,
+  snapshot_hash TEXT,
+  generated_at REAL,
+  updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_collection_topic_papers_paper
+  ON collection_topic_papers(paper_id, topic_id);
 """
 
 _V2_COLUMNS = {
@@ -160,6 +186,7 @@ _V2_COLUMNS = {
     "obsidian_hash": "TEXT",
     "awards": "TEXT",
     "keywords": "TEXT",
+    "normalized_orgs": "TEXT",
 }
 
 
@@ -656,6 +683,134 @@ class Store:
                  report_path=excluded.report_path,status=excluded.status,
                  updated_at=excluded.updated_at""",
             (paper_id, str(report_path), status, now, now),
+        )
+        if commit:
+            self.conn.commit()
+
+    def list_collection_topics(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """SELECT t.*,count(tp.paper_id) AS paper_count,
+                      COALESCE(r.status,'none') AS review_status
+               FROM collection_topics t
+               LEFT JOIN collection_topic_papers tp ON tp.topic_id=t.id
+               LEFT JOIN topic_reviews r ON r.topic_id=t.id
+               GROUP BY t.id ORDER BY lower(t.name),t.id"""
+        ).fetchall()
+
+    def get_collection_topic(self, topic_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            """SELECT t.*,count(tp.paper_id) AS paper_count,
+                      COALESCE(r.status,'none') AS review_status
+               FROM collection_topics t
+               LEFT JOIN collection_topic_papers tp ON tp.topic_id=t.id
+               LEFT JOIN topic_reviews r ON r.topic_id=t.id
+               WHERE t.id=? GROUP BY t.id""", (topic_id,)
+        ).fetchone()
+
+    def create_collection_topic(self, name: str) -> sqlite3.Row:
+        clean = str(name or "").strip()
+        if not clean:
+            raise ValueError("topic name cannot be empty")
+        now = time.time()
+        self.conn.execute(
+            "INSERT INTO collection_topics(name,created_at,updated_at) VALUES (?,?,?)",
+            (clean, now, now),
+        )
+        topic_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.commit()
+        return self.get_collection_topic(topic_id)
+
+    def delete_collection_topic(self, topic_id: int) -> dict | None:
+        topic = self.get_collection_topic(topic_id)
+        if topic is None:
+            return None
+        review = self.get_topic_review(topic_id)
+        self.conn.execute("DELETE FROM collection_topics WHERE id=?", (topic_id,))
+        self.conn.commit()
+        return {"topic": topic, "review": review}
+
+    def add_paper_to_collection(self, topic_id: int, paper_id: str) -> bool:
+        if self.get_collection_topic(topic_id) is None:
+            raise KeyError("topic not found")
+        if self.get(paper_id) is None:
+            raise LookupError("paper not found")
+        before = self.conn.total_changes
+        now = time.time()
+        self.conn.execute(
+            "INSERT OR IGNORE INTO collection_topic_papers(topic_id,paper_id,added_at) VALUES (?,?,?)",
+            (topic_id, paper_id, now),
+        )
+        changed = self.conn.total_changes > before
+        if changed:
+            self.conn.execute("UPDATE collection_topics SET updated_at=? WHERE id=?", (now, topic_id))
+            self._mark_topic_review_stale(topic_id, commit=False)
+        self.conn.commit()
+        return changed
+
+    def remove_paper_from_collection(self, topic_id: int, paper_id: str) -> bool:
+        if self.get_collection_topic(topic_id) is None:
+            raise KeyError("topic not found")
+        before = self.conn.total_changes
+        self.conn.execute(
+            "DELETE FROM collection_topic_papers WHERE topic_id=? AND paper_id=?",
+            (topic_id, paper_id),
+        )
+        changed = self.conn.total_changes > before
+        if changed:
+            now = time.time()
+            self.conn.execute("UPDATE collection_topics SET updated_at=? WHERE id=?", (now, topic_id))
+            self._mark_topic_review_stale(topic_id, commit=False)
+        self.conn.commit()
+        return changed
+
+    def collection_papers(self, topic_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """SELECT p.*,tp.added_at
+               FROM collection_topic_papers tp JOIN papers p ON p.id=tp.paper_id
+               WHERE tp.topic_id=? ORDER BY COALESCE(p.year,0),lower(p.title),p.id""",
+            (topic_id,),
+        ).fetchall()
+
+    def paper_collection_ids(self, paper_id: str) -> list[int]:
+        return [r[0] for r in self.conn.execute(
+            "SELECT topic_id FROM collection_topic_papers WHERE paper_id=? ORDER BY topic_id",
+            (paper_id,),
+        )]
+
+    def get_topic_review(self, topic_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM topic_reviews WHERE topic_id=?", (topic_id,)
+        ).fetchone()
+
+    def set_topic_review(self, topic_id: int, *, status: str, stage: str = "",
+                         completed_papers: int = 0, total_papers: int = 0,
+                         error: str | None = None, review_path: str | None = None,
+                         snapshot_hash: str | None = None, generated: bool = False,
+                         commit: bool = True) -> None:
+        now = time.time()
+        self.conn.execute(
+            """INSERT INTO topic_reviews
+               (topic_id,review_path,status,stage,completed_papers,total_papers,error,
+                snapshot_hash,generated_at,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(topic_id) DO UPDATE SET
+                 review_path=COALESCE(excluded.review_path,topic_reviews.review_path),
+                 status=excluded.status,stage=excluded.stage,
+                 completed_papers=excluded.completed_papers,total_papers=excluded.total_papers,
+                 error=excluded.error,snapshot_hash=COALESCE(excluded.snapshot_hash,topic_reviews.snapshot_hash),
+                 generated_at=COALESCE(excluded.generated_at,topic_reviews.generated_at),
+                 updated_at=excluded.updated_at""",
+            (topic_id, review_path, status, stage, completed_papers, total_papers,
+             error, snapshot_hash, now if generated else None, now),
+        )
+        if commit:
+            self.conn.commit()
+
+    def _mark_topic_review_stale(self, topic_id: int, *, commit: bool = True) -> None:
+        now = time.time()
+        self.conn.execute(
+            """UPDATE topic_reviews SET status=CASE WHEN status='running' THEN status ELSE 'stale' END,
+                      updated_at=? WHERE topic_id=?""", (now, topic_id)
         )
         if commit:
             self.conn.commit()

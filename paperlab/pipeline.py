@@ -387,7 +387,8 @@ def score_topics(store: Store, cfg: Config, *, topic_names: list[str] | None = N
         needed_names = sorted({name for row in chunk for name in pending_by_paper[row["id"]]})
         needed_topics = [topic_map[name] for name in needed_names]
         try:
-            results = rel_mod.score_multi_batch(chunk, needed_topics, model=cfg.models.scorer)
+            from .llm import get_model
+            results = rel_mod.score_multi_batch(chunk, needed_topics, model=get_model())
         except Exception as exc:
             log(f"  [score] batch {start // batch_size + 1} failed ({exc}); left pending")
             continue
@@ -400,7 +401,7 @@ def score_topics(store: Store, cfg: Config, *, topic_names: list[str] | None = N
                 score_value, reason = result
                 store.set_topic_score(
                     row["id"], topic_id, score_value, reason,
-                    threshold=topic.relevance_threshold, model=cfg.models.scorer,
+                    threshold=topic.relevance_threshold, model=get_model(),
                     definition_hash=hashes[topic_id], prompt_version=rel_mod.PROMPT_VERSION,
                 )
                 done += 1
@@ -554,7 +555,7 @@ def extract(store: Store, cfg: Config, topic: TopicConfig, *, log=print) -> int:
         pdf_path = Path(row["pdf_path"])
         try:
             ext = extract_mod.extract_paper(row["title"], row["authors"], row["abstract"],
-                                            pdf_path, model=cfg.models.extractor)
+                                            pdf_path, model=get_model())
         except Exception as exc:
             log(f"  [extract] {row['id']}: LLM failed ({exc})")
             continue
@@ -570,7 +571,7 @@ def extract(store: Store, cfg: Config, topic: TopicConfig, *, log=print) -> int:
             try:
                 mermaid = figure_mod.generate_mermaid(
                     row["title"], ext.get("target_problem", ""), ext.get("core_idea", ""),
-                    model=cfg.models.figure)
+                    model=get_model())
                 if mermaid:
                     kind = "mermaid"
             except Exception:
@@ -605,4 +606,3 @@ def download_single(store: Store, cfg: Config, paper_id: str, *, log=print) -> i
     store.conn.execute("UPDATE papers SET pdf_status='error' WHERE id=?", (paper_id,))
     store.conn.commit()
     return 0
-
