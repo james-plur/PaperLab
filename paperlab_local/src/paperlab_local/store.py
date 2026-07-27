@@ -591,13 +591,13 @@ class Store:
             self.conn.execute(
                 """INSERT INTO papers
                 (id, arxiv_id, doi, norm_title_hash, title, authors, organizations, awards,
-                 venue, year, track, topics, abstract, citation_count, pdf_status,
+                 venue, year, track, topics, abstract, keywords, citation_count, pdf_status,
                  pdf_url, discovered_at, last_updated, published_date, source_url,
                  metadata_status, authors_json, organizations_json)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (paper_id, arxiv_id, doi, normalized_hash, title, authors, organizations,
                  candidate.get("awards"), candidate.get("venue"), candidate.get("year"), candidate.get("track"),
-                 topic_name or "", candidate.get("abstract"), candidate.get("citation_count"),
+                 topic_name or "", candidate.get("abstract"), candidate.get("keywords"), candidate.get("citation_count"),
                  None, candidate.get("pdf_url"), now, now, candidate.get("published_date"),
                  candidate.get("source_url") or candidate.get("url"),
                  "complete" if candidate.get("abstract") else "pending",
@@ -689,7 +689,7 @@ class Store:
                 updates["year"] = candidate.get("year")
         if venue and (not row["venue"] or (row["venue"] == "arXiv" and venue != "arXiv")):
             updates["venue"] = venue
-        for key in ("authors", "organizations", "awards", "year", "track", "abstract",
+        for key in ("authors", "organizations", "awards", "year", "track", "abstract", "keywords",
                     "citation_count", "pdf_url", "published_date", "source_url"):
             value = candidate.get(key)
             if key == "source_url" and not value:

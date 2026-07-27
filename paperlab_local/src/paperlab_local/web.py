@@ -262,7 +262,7 @@ def search_papers(db_path, params):
 
 def update_paper(db_path, paper_id, fields, base_version=None):
     allowed = ("title", "authors", "organizations", "abstract", "keywords",
-               "doi", "arxiv_id", "source_url", "pdf_url", "awards")
+               "doi", "arxiv_id", "venue", "year", "source_url", "pdf_url", "awards")
     from .store import Store
     with Store(str(db_path), backup_on_migrate=False) as store:
         conn = store.conn
@@ -913,6 +913,31 @@ class PaperHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         try:
+            if parsed.path == "/api/papers/import/preview":
+                if not self._require_admin():
+                    return
+                from .paper_import import ImportError as PaperImportError, MAX_PDF_BYTES, preview_pdf
+                if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/pdf":
+                    self._send_json({"error": "Content-Type must be application/pdf"}, 415)
+                    return
+                length = int(self.headers.get("Content-Length", 0))
+                if length <= 0:
+                    self._send_json({"error": "empty PDF upload"}, 400)
+                    return
+                if length > MAX_PDF_BYTES:
+                    self._send_json({"error": "PDF exceeds 50 MB limit"}, 413)
+                    return
+                try:
+                    result = preview_pdf(
+                        self.db_path, self.rfile.read(length),
+                        provider=self.headers.get("X-PaperLab-Provider"),
+                        model=self.headers.get("X-PaperLab-Model"),
+                    )
+                except PaperImportError as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                    return
+                self._send_json(result)
+                return
             data = self._read_json(5 * 1024 * 1024 if parsed.path == "/api/sync/push" else 2 * 1024 * 1024)
             if parsed.path == "/api/auth/login":
                 from .auth import AUTH, SESSION_COOKIE
@@ -1001,6 +1026,19 @@ class PaperHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/download":
                 self._do_download(data.get("paper_id", ""))
+            elif parsed.path == "/api/papers":
+                from .config import load_config
+                from .paper_import import ImportError as PaperImportError, finalize_import
+                try:
+                    cfg = load_config(str(self.config_path))
+                    result = finalize_import(self.db_path, cfg.pdf_root, data)
+                except PaperImportError as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                    return
+                if result.get("conflict"):
+                    self._send_json({"error": "paper already exists", **result}, 409)
+                    return
+                self._send_json(result, 201 if result.get("created") else 200)
             elif parsed.path == "/api/edit":
                 try:
                     result = update_paper(self.db_path, data.get("paper_id", ""), data.get("fields", {}),
@@ -1122,6 +1160,8 @@ def serve(db_path, host="127.0.0.1", port=8765, config_path=None):
     repaired_pdfs = reconcile_pdf_paths(db_path, cfg.pdf_root)
     if repaired_pdfs:
         print(f"PaperLab repaired {repaired_pdfs} PDF path(s)", flush=True)
+    from .paper_import import cleanup_previews
+    cleanup_previews(db_path)
     from .store import Store
     with Store(str(db_path), backup_on_migrate=False) as store:
         store.conn.execute(
@@ -1198,6 +1238,7 @@ a{color:var(--accent);text-decoration:none}.pager{display:flex;justify-content:c
 <select id="year"><option value="">All years</option></select>
 <select id="org"><option value="">All orgs</option></select>
 <span id="stat" class="stat"></span>
+<button id="addPaperButton" class="admin-only" onclick="openAddPaper()">Add Paper</button>
 <button id="llmSettings" class="admin-only" title="Report model settings">LLM Settings</button>
 <button id="syncButton" class="admin-only">Sync</button>
 <button id="authButton" class="auth-status">Admin login</button>
@@ -1253,11 +1294,27 @@ a{color:var(--accent);text-decoration:none}.pager{display:flex;justify-content:c
 <div class="modal-overlay" id="topicModal"><div class="modal"><h2>Add to topic</h2><input type="hidden" id="topic-paper-id"><div id="topicChoices"></div><div class="modal-actions"><button class="btn-cancel" onclick="closeTopicPicker()">Close</button></div></div></div>
 <div class="modal-overlay" id="createTopicModal"><div class="modal"><h2>New topic</h2><label for="new-topic-name">Name</label><input id="new-topic-name" type="text" maxlength="120"><div class="modal-actions"><button class="btn-cancel" onclick="closeCreateTopic()">Cancel</button><button class="btn-save" onclick="submitCreateTopic()">Create</button></div></div></div>
 <div class="modal-overlay" id="loginModal"><div class="modal"><h2>Administrator login</h2><label for="admin-username">Username</label><input id="admin-username" value="admin" autocomplete="username"><label for="admin-password">Password</label><input id="admin-password" type="password" autocomplete="current-password"><div id="loginError" class="review-status"></div><div class="modal-actions"><button class="btn-cancel" onclick="closeLogin()">Cancel</button><button class="btn-save" onclick="login()">Login</button></div></div></div>
+<div class="modal-overlay" id="addPaperModal"><div class="modal report-modal"><h2>Add Paper</h2>
+<label for="importPdf">Upload PDF (optional, maximum 50 MB)</label><input id="importPdf" type="file" accept="application/pdf,.pdf"><button class="btn-save" id="parsePdfButton" onclick="parseImportPdf()">Parse PDF</button>
+<div id="importStatus" class="review-status"></div><div id="importDuplicate" class="paper" style="display:none"></div>
+<label for="import-title">Title *</label><textarea id="import-title" rows="2"></textarea>
+<label><input class="import-overwrite" data-field="authors" type="checkbox" style="width:auto"> overwrite existing · Authors</label><input id="import-authors" aria-label="Authors">
+<label><input class="import-overwrite" data-field="organizations" type="checkbox" style="width:auto"> overwrite existing · Organizations</label><input id="import-organizations" aria-label="Organizations">
+<label><input class="import-overwrite" data-field="abstract" type="checkbox" style="width:auto"> overwrite existing · Abstract</label><textarea id="import-abstract" aria-label="Abstract" rows="7"></textarea>
+<label><input class="import-overwrite" data-field="keywords" type="checkbox" style="width:auto"> overwrite existing · Keywords</label><input id="import-keywords">
+<label><input class="import-overwrite" data-field="doi" type="checkbox" style="width:auto"> overwrite existing · DOI</label><input id="import-doi">
+<label><input class="import-overwrite" data-field="arxiv_id" type="checkbox" style="width:auto"> overwrite existing · arXiv ID</label><input id="import-arxiv_id">
+<label><input class="import-overwrite" data-field="venue" type="checkbox" style="width:auto"> overwrite existing · Venue</label><input id="import-venue">
+<label><input class="import-overwrite" data-field="year" type="checkbox" style="width:auto"> overwrite existing · Year</label><input id="import-year" type="number" min="1900" max="2100">
+<label><input class="import-overwrite" data-field="source_url" type="checkbox" style="width:auto"> overwrite existing · Source URL</label><input id="import-source_url" type="url">
+<label><input class="import-overwrite" data-field="pdf_url" type="checkbox" style="width:auto"> overwrite existing · PDF URL</label><input id="import-pdf_url" type="url">
+<div class="modal-actions"><button class="btn-cancel" onclick="closeAddPaper()">Cancel</button><button class="btn-save" id="saveImportButton" onclick="saveImportedPaper()">Save Paper</button></div>
+</div></div>
 <div class="modal-overlay" id="markdownModal"><div class="modal report-modal"><h2 id="markdownTitle">Edit Markdown</h2><textarea id="markdownContent" class="markdown-editor"></textarea><details><summary>Version history</summary><div id="historyList"></div></details><div class="modal-actions"><button class="btn-cancel" onclick="closeMarkdownEditor()">Cancel</button><button class="btn-save" onclick="previewMarkdown()">Preview</button><button class="btn-save" onclick="saveMarkdown()">Save</button></div><div id="markdownPreview" class="topic-review" style="display:none"></div></div></div>
 <div class="modal-overlay" id="syncModal"><div class="modal report-modal"><h2>Synchronization</h2><div id="syncStatus" class="stat">Loading…</div><h3>Open conflicts</h3><div id="conflictList"></div><h3>Register local device</h3><input id="deviceName" placeholder="MacBook"><div class="modal-actions"><button class="btn-cancel" onclick="closeSync()">Close</button><button class="btn-save" onclick="registerDevice()">Create device token</button></div><pre id="deviceToken" style="display:none"></pre></div></div>
 <script>
 function openInEditor(path){fetch("/api/open_file",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:path})}).catch(function(){alert("Could not open file: "+path)});}
-const S={page:1,pages:1,mode:"library",llm:null,topics:[],activeTopic:null,reviewTimer:null,visiblePapers:[],topicReviewAvailable:false,admin:false,csrf:null,markdown:null};
+const S={page:1,pages:1,mode:"library",llm:null,topics:[],activeTopic:null,reviewTimer:null,visiblePapers:[],topicReviewAvailable:false,admin:false,csrf:null,markdown:null,importToken:null,importDuplicate:null};
 const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const nativeFetch=window.fetch.bind(window);window.fetch=(url,opts={})=>{opts={...opts};const method=(opts.method||"GET").toUpperCase();if(method!=="GET"&&S.csrf){opts.headers={...(opts.headers||{}),"X-CSRF-Token":S.csrf};}return nativeFetch(url,opts);};
@@ -1265,6 +1322,14 @@ async function loadSession(){const d=await nativeFetch("/api/auth/session").then
 function closeLogin(){$("loginModal").classList.remove("show");}
 async function login(){const r=await nativeFetch("/api/auth/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:$("admin-username").value,password:$("admin-password").value})});const d=await r.json();if(!r.ok){$("loginError").textContent=d.error||"Login failed";return;}S.csrf=d.csrf_token;closeLogin();await loadSession();await loadTopics();load(true);}
 async function authAction(){if(!S.admin){$("admin-password").value="";$("loginError").textContent="";$("loginModal").classList.add("show");return;}if($("authButton").textContent==="Local admin")return;await fetch("/api/auth/logout",{method:"POST"});S.csrf=null;await loadSession();load(true);}
+const importFields=["title","authors","organizations","abstract","keywords","doi","arxiv_id","venue","year","source_url","pdf_url"];
+function importValues(){const values={};importFields.forEach(f=>values[f]=$("import-"+f).value.trim());if(values.year)values.year=Number(values.year);return values;}
+function fillImport(values){importFields.forEach(f=>{$("import-"+f).value=(values&&values[f])||"";});}
+function showImportDuplicate(p){S.importDuplicate=p||null;const box=$("importDuplicate");if(!p){box.style.display="none";box.innerHTML="";return;}box.style.display="block";box.innerHTML="<b>Existing paper found:</b> "+esc(p.title)+"<br><span class=\"stat\">Unchecked fields only fill missing values. Check a field to overwrite its existing value.</span>";}
+function openAddPaper(){S.importToken=null;S.importDuplicate=null;fillImport({});$("importPdf").value="";$("importStatus").textContent="";showImportDuplicate(null);document.querySelectorAll(".import-overwrite").forEach(x=>x.checked=false);$("addPaperModal").classList.add("show");}
+function closeAddPaper(){$("addPaperModal").classList.remove("show");}
+async function parseImportPdf(){const file=$("importPdf").files[0];if(!file){$("importStatus").textContent="Choose a PDF first.";return;}if(file.size>50*1024*1024){$("importStatus").textContent="PDF exceeds 50 MB.";return;}const button=$("parsePdfButton");button.disabled=true;$("importStatus").textContent="Parsing PDF…";try{if(!S.llm)await loadLLMConfig();const active=S.llm&&S.llm.active_provider;const headers={"Content-Type":"application/pdf","X-PaperLab-Filename":file.name};if(active){headers["X-PaperLab-Provider"]=active;headers["X-PaperLab-Model"]=S.llm.providers[active].model;}const r=await fetch("/api/papers/import/preview",{method:"POST",headers,body:file});const d=await r.json();if(!r.ok)throw new Error(d.error||"PDF parsing failed");S.importToken=d.import_token;fillImport(d.fields||{});showImportDuplicate(d.duplicate);$("importStatus").textContent=(d.warnings||[]).join(" ")||"PDF parsed. Review fields before saving.";}catch(e){$("importStatus").textContent=e.message;}finally{button.disabled=false;}}
+async function saveImportedPaper(){const fields=importValues();if(!fields.title){$("importStatus").textContent="Title is required.";return;}const checked=[...document.querySelectorAll(".import-overwrite:checked")].map(x=>x.dataset.field);const body={fields,import_token:S.importToken};if(S.importDuplicate){body.duplicate_action=checked.length?"overwrite_fields":"fill_missing";body.overwrite_fields=checked;}const button=$("saveImportButton");button.disabled=true;try{const r=await fetch("/api/papers",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});const d=await r.json();if(r.status===409&&d.conflict){showImportDuplicate(d.conflict);$("importStatus").textContent="This paper already exists. Review the merge options, then save again.";return;}if(!r.ok)throw new Error(d.error||"Import failed");closeAddPaper();showLibrary();$("q").value=fields.title;await load(true);}catch(e){$("importStatus").textContent=e.message;}finally{button.disabled=false;}}
 async function openSync(){$("syncModal").classList.add("show");const [status,conflicts]=await Promise.all([fetch("/api/sync/status").then(r=>r.json()),fetch("/api/sync/conflicts").then(r=>r.json())]);$("syncStatus").textContent="Sequence "+status.latest_sequence+" · "+status.devices.length+" devices · "+status.pending_uploads+" pending uploads · "+status.open_conflicts+" conflicts"+(status.last_success?" · last sync "+new Date(status.last_success*1000).toLocaleString():"")+(status.last_error?" · error: "+status.last_error:"");$("conflictList").innerHTML=(conflicts.conflicts||[]).map(c=>'<div class="paper"><b>'+esc(c.entity_type+" · "+c.entity_id+" · "+c.field)+'</b><div class="modal-actions"><button onclick="resolveConflict('+c.id+',\'local\')">Keep local</button><button onclick="resolveConflict('+c.id+',\'remote\')">Use remote</button></div></div>').join("")||'<div class="stat">No open conflicts</div>';}
 function closeSync(){$("syncModal").classList.remove("show");}
 async function registerDevice(){const r=await fetch("/api/sync/devices",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:$("deviceName").value||"Local device"})});const d=await r.json();if(!r.ok){alert(d.error||"Could not create device");return;}$("deviceToken").textContent="Device ID: "+d.device_id+"\nToken (shown once): "+d.token;$("deviceToken").style.display="block";openSync();}

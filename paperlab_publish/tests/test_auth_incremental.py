@@ -10,12 +10,24 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import requests
+import pymupdf
 
 from paperlab_publish.auth import AUTH, hash_password
 from paperlab_publish.auth import AuthManager
 from paperlab_publish.incremental import change_dict, push_to_server, sync_now
 from paperlab_publish.store import Store
 from paperlab_publish.web import PaperHandler, update_paper
+
+
+def _upload_pdf():
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "HTTP Imported Paper", fontsize=20)
+    page.insert_text((72, 120), "Abstract: A manually imported systems paper.\n1 Introduction", fontsize=11)
+    doc.set_metadata({"title": "HTTP Imported Paper", "author": "Alice Example"})
+    value = doc.tobytes()
+    doc.close()
+    return value
 
 
 class AuthWebTests(unittest.TestCase):
@@ -121,6 +133,46 @@ class AuthWebTests(unittest.TestCase):
         history = session.get(self.url + "/api/history/report/" + paper_id, timeout=5).json()
         self.assertEqual(history["versions"][0]["version"], 1)
         self.assertIn("let h=esc(md)", __import__("paperlab_publish.web", fromlist=["HTML"]).HTML)
+
+    def test_add_paper_preview_manual_create_and_duplicate_merge(self):
+        denied = requests.post(self.url + "/api/papers/import/preview",
+                               headers={"Content-Type": "application/pdf"}, data=_upload_pdf(), timeout=5)
+        self.assertEqual(denied.status_code, 401)
+        session = requests.Session()
+        login = session.post(self.url + "/api/auth/login",
+                             json={"username": "admin", "password": "correct horse battery staple"}, timeout=5)
+        csrf = login.json()["csrf_token"]
+        headers = {"X-CSRF-Token": csrf, "Content-Type": "application/pdf"}
+        no_csrf = session.post(self.url + "/api/papers/import/preview",
+                               headers={"Content-Type": "application/pdf"}, data=_upload_pdf(), timeout=5)
+        self.assertEqual(no_csrf.status_code, 403)
+        invalid = session.post(self.url + "/api/papers/import/preview", headers=headers,
+                               data=b"not-pdf", timeout=5)
+        self.assertEqual(invalid.status_code, 400)
+        with patch("paperlab_publish.paper_import._llm_fields", return_value={"keywords": "systems, import"}):
+            preview = session.post(self.url + "/api/papers/import/preview", headers=headers,
+                                   data=_upload_pdf(), timeout=5)
+        self.assertEqual(preview.status_code, 200)
+        token = preview.json()["import_token"]
+        json_headers = {"X-CSRF-Token": csrf, "Content-Type": "application/json"}
+        created = session.post(self.url + "/api/papers", headers=json_headers, json={
+            "import_token": token,
+            "fields": {"title": "HTTP Imported Paper", "abstract": "Original", "keywords": "systems"},
+        }, timeout=5)
+        self.assertEqual(created.status_code, 201)
+        self.assertTrue(created.json()["has_pdf"])
+        duplicate = session.post(self.url + "/api/papers", headers=json_headers,
+                                 json={"fields": {"title": "HTTP Imported Paper", "abstract": "Changed"}}, timeout=5)
+        self.assertEqual(duplicate.status_code, 409)
+        merged = session.post(self.url + "/api/papers", headers=json_headers, json={
+            "fields": {"title": "HTTP Imported Paper", "abstract": "Changed", "organizations": "MIT"},
+            "duplicate_action": "fill_missing",
+        }, timeout=5)
+        self.assertEqual(merged.status_code, 200)
+        with Store(self.db, backup_on_migrate=False) as store:
+            row = store.get(created.json()["paper_id"])
+            self.assertEqual(row["abstract"], "Original")
+            self.assertEqual(row["organizations"], "MIT")
 
     def test_http_bidirectional_incremental_sync(self):
         token = "sync-secret"
