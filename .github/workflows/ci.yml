@@ -8,24 +8,44 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  boundaries:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python scripts/check_boundaries.py
+
+  application:
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
+        project: [paperlab_local, paperlab_publish]
+        include:
+          - project: paperlab_local
+            extra: sync
+          - project: paperlab_publish
+            extra: backup
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install
-        run: python -m pip install -e ".[sync]"
-      - name: Compile
-        run: python -m compileall -q paperlab
-      - name: Test
-        run: python -m unittest discover -s tests
-      - name: Reject runtime data and secrets
-        run: |
+          cache: pip
+      - run: pip install -e "${{ matrix.project }}[${{ matrix.extra }}]"
+      - run: python -m compileall -q "${{ matrix.project }}/src"
+      - run: python -m unittest discover -s "${{ matrix.project }}/tests"
+
+  reject-runtime-data-and-secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
           test ! -e .env
+          test ! -e paperlab_local/.env
+          test ! -e paperlab_publish/.env
+          test ! -e paperlab_publish/deploy/server.env
           test ! -e data/papers.db
           test -z "$(find pdfs reports -type f ! -name .gitkeep -print 2>/dev/null)"

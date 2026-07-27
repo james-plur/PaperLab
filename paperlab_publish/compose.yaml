@@ -1,0 +1,36 @@
+services:
+  paperlab:
+    build: .
+    restart: unless-stopped
+    env_file: [.env, deploy/server.env]
+    expose: ["8765"]
+    volumes:
+      - ./topics.yaml:/app/topics.yaml:ro
+      - ./data:/app/data
+      - ./pdfs:/app/pdfs
+      - ./reports:/app/reports
+      - ./figures:/app/figures
+      - ./reviews:/app/reviews
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/facets', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks: [paperlab]
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    depends_on:
+      paperlab: {condition: service_healthy}
+    env_file: [deploy/server.env]
+    ports: ["80:80", "443:443", "443:443/udp"]
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [paperlab]
+networks:
+  paperlab:
+volumes:
+  caddy_data:
+  caddy_config:

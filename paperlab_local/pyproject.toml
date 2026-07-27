@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paperlab-local"
+version = "0.3.0"
+description = "Local-first PaperLab collector, authoring UI, and sync client."
+requires-python = ">=3.10"
+dependencies = [
+  "requests>=2.31",
+  "pymupdf>=1.24",
+  "openai>=1.40",
+  "pyyaml>=6.0",
+  "jinja2>=3.1",
+  "argon2-cffi>=23.1",
+]
+
+[project.optional-dependencies]
+sync = ["boto3>=1.35", "zstandard>=0.23"]
+
+[project.scripts]
+paperlab-local = "paperlab_local.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["paperlab_local*"]
+
+[tool.setuptools.package-dir]
+"" = "src"

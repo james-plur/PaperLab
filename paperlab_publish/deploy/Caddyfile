@@ -1,0 +1,13 @@
+{$PAPERLAB_ADDRESS} {
+    tls internal
+    encode zstd gzip
+    reverse_proxy paperlab:8765
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Frame-Options "DENY"
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    }
+    request_body {
+        max_size 5MB
+    }
+}

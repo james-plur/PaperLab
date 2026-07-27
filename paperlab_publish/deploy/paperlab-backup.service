@@ -1,0 +1,11 @@
+[Unit]
+Description=PaperLab daily database backup
+After=paperlab.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/srv/paperlab-publish
+Environment=PAPERLAB_ROOT=/srv/paperlab-publish
+ExecStart=/srv/paperlab-publish/deploy/backup.sh

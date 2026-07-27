@@ -8,6 +8,8 @@ dist/
 
 # venv / tooling
 .venv/
+paperlab_local/.venv/
+paperlab_publish/.venv/
 .uv-cache/
 .DS_Store
 
@@ -18,12 +20,18 @@ pdfs/*
 !pdfs/.gitkeep
 reports/*
 !reports/.gitkeep
+figures/*
+reviews/*
+backups/
 logs/
 site/
 site_smoke/
 
 # secrets
 .env
+paperlab_local/.env
+paperlab_publish/.env
+paperlab_publish/deploy/*.env
 data/llm_config.json
 .publish/
 data/publish-state.json
@@ -33,5 +41,7 @@ data/sync-state.json
 
 # local topic config (start from topics.example.yaml)
 topics.yaml
+paperlab_local/topics.yaml
+paperlab_publish/topics.yaml
 topics.smoke.yaml
 topics.kvcache.yaml

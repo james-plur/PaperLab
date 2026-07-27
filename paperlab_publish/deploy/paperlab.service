@@ -1,0 +1,22 @@
+[Unit]
+Description=PaperLab Web and Sync Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/srv/paperlab-publish
+EnvironmentFile=/srv/paperlab-publish/.env
+EnvironmentFile=/srv/paperlab-publish/deploy/server.env
+ExecStart=/srv/paperlab-publish/.venv/bin/paperlab-publish --config /srv/paperlab-publish/topics.yaml web serve --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/srv/paperlab-publish
+
+[Install]
+WantedBy=multi-user.target
