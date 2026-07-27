@@ -16,6 +16,31 @@ def _connect(db_path):
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
+def reconcile_pdf_paths(db_path, pdf_root):
+    """Repair portable PDF links after a database or data-directory migration."""
+    pdf_dir = Path(pdf_root).resolve() / "pdfs"
+    if not pdf_dir.is_dir():
+        return 0
+    available = {path.stem: path.resolve() for path in pdf_dir.rglob("*.pdf")
+                 if path.is_file() and path.stat().st_size >= 1000}
+    conn = _connect(db_path)
+    repaired = 0
+    try:
+        for row in conn.execute("SELECT id,pdf_path FROM papers WHERE deleted_at IS NULL"):
+            current = Path(row["pdf_path"]) if row["pdf_path"] else None
+            if current and current.is_file():
+                continue
+            key = row["id"].replace(":", "-").replace("/", "_")
+            candidate = available.get(key)
+            if candidate:
+                conn.execute("UPDATE papers SET pdf_path=?,pdf_status='ok' WHERE id=?",
+                             (str(candidate), row["id"]))
+                repaired += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return repaired
+
 _TOPIC_TASKS_LOCK = threading.Lock()
 _TOPIC_TASKS: set[tuple[str, int]] = set()
 
@@ -1092,6 +1117,11 @@ def serve(db_path, host="127.0.0.1", port=8765, config_path=None):
     })
     server = ThreadingHTTPServer((host, port), handler)
     # Recovery belongs to startup, never to a public GET request.
+    from .config import load_config
+    cfg = load_config(str(handler.config_path))
+    repaired_pdfs = reconcile_pdf_paths(db_path, cfg.pdf_root)
+    if repaired_pdfs:
+        print(f"PaperLab repaired {repaired_pdfs} PDF path(s)", flush=True)
     from .store import Store
     with Store(str(db_path), backup_on_migrate=False) as store:
         store.conn.execute(

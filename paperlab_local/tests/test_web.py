@@ -3,10 +3,24 @@ import unittest
 from pathlib import Path
 
 from paperlab_local.store import Store
-from paperlab_local.web import HTML, query_facets, query_papers
+from paperlab_local.web import HTML, query_facets, query_papers, reconcile_pdf_paths
 
 
 class TestWebQueries(unittest.TestCase):
+    def test_reconcile_pdf_paths_restores_migrated_file_link(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db = root / "papers.db"
+            with Store(db) as store:
+                paper_id = store.upsert_candidate({"title": "Portable PDF"})
+            pdf_dir = root / "pdfs"
+            pdf_dir.mkdir()
+            target = pdf_dir / (paper_id.replace(":", "-").replace("/", "_") + ".pdf")
+            target.write_bytes(b"%PDF-1.7\n" + b"x" * 1200)
+            self.assertEqual(reconcile_pdf_paths(db, root), 1)
+            with Store(db, backup_on_migrate=False) as store:
+                self.assertEqual(Path(store.get(paper_id)["pdf_path"]), target.resolve())
+
     def test_missing_report_triggers_generation(self):
         self.assertIn('else if(r.ok&&d.status==="none")', HTML)
         self.assertIn('await generateReport(id);', HTML)
