@@ -61,15 +61,15 @@ class AuthWebTests(unittest.TestCase):
         self.env.stop()
         self.temp.cleanup()
 
-    def test_anonymous_read_login_csrf_and_edit(self):
+    def test_login_required_and_business_writes_are_read_only(self):
+        health = requests.get(self.url + "/api/health", timeout=5)
+        self.assertEqual(health.status_code, 200)
+        self.assertIn("note_sync", health.json()["capabilities"])
         public = requests.get(self.url + "/api/papers", timeout=5)
-        self.assertEqual(public.status_code, 200)
-        paper = public.json()["papers"][0]
-        self.assertNotIn(str(self.root), json.dumps(paper))
-        self.assertIn("noindex", public.headers["X-Robots-Tag"])
+        self.assertEqual(public.status_code, 401)
 
-        denied = requests.post(self.url + "/api/edit", json={"paper_id": paper["id"]}, timeout=5)
-        self.assertEqual(denied.status_code, 401)
+        denied = requests.post(self.url + "/api/edit", json={"paper_id": "missing"}, timeout=5)
+        self.assertEqual(denied.status_code, 403)
         llm = requests.get(self.url + "/api/llm/config", timeout=5)
         self.assertEqual(llm.status_code, 401)
 
@@ -77,6 +77,10 @@ class AuthWebTests(unittest.TestCase):
         login = session.post(self.url + "/api/auth/login",
                              json={"username": "admin", "password": "correct horse battery staple"}, timeout=5)
         self.assertEqual(login.status_code, 200)
+        paper_response = session.get(self.url + "/api/papers", timeout=5)
+        self.assertEqual(paper_response.status_code, 200)
+        paper = paper_response.json()["papers"][0]
+        self.assertNotIn(str(self.root), json.dumps(paper))
         csrf = login.json()["csrf_token"]
         no_csrf = session.post(self.url + "/api/edit", json={"paper_id": paper["id"]}, timeout=5)
         self.assertEqual(no_csrf.status_code, 403)
@@ -85,8 +89,8 @@ class AuthWebTests(unittest.TestCase):
             json={"paper_id": paper["id"], "base_version": paper["version"],
                   "fields": {"title": "Edited"}},
         )
-        self.assertEqual(edited.status_code, 200)
-        self.assertEqual(edited.json()["paper"]["title"], "Edited")
+        self.assertEqual(edited.status_code, 403)
+        self.assertEqual(edited.json()["error"], "read_only_server")
 
     def test_device_object_upload_is_resumable_and_hash_checked(self):
         token = "device-secret"
@@ -112,32 +116,24 @@ class AuthWebTests(unittest.TestCase):
         downloaded = requests.get(url, headers=headers, timeout=5)
         self.assertEqual(downloaded.content, content)
 
-    def test_admin_can_rename_topic_and_edit_markdown_with_versions(self):
+    def test_logged_in_user_cannot_mutate_topics_or_markdown(self):
         session = requests.Session()
         login = session.post(self.url + "/api/auth/login",
                              json={"username": "admin", "password": "correct horse battery staple"}, timeout=5)
         csrf = login.json()["csrf_token"]
         headers = {"X-CSRF-Token": csrf, "Content-Type": "application/json"}
-        topic = session.post(self.url + "/api/topics", headers=headers,
-                             json={"name": "Old name"}, timeout=5).json()
-        renamed = session.patch(self.url + f"/api/topics/{topic['id']}", headers=headers,
-                                json={"name": "New name", "base_version": topic["version"]}, timeout=5)
-        self.assertEqual(renamed.status_code, 200)
-        self.assertEqual(renamed.json()["name"], "New name")
-        paper_id = requests.get(self.url + "/api/papers", timeout=5).json()["papers"][0]["id"]
+        created = session.post(self.url + "/api/topics", headers=headers, json={"name":"Old name"}, timeout=5)
+        self.assertEqual(created.status_code, 403)
+        paper_id = session.get(self.url + "/api/papers", timeout=5).json()["papers"][0]["id"]
         saved = session.put(self.url + "/api/reports/" + paper_id, headers=headers,
                             json={"content": "# Safe\n<script>alert(1)</script>", "base_version": 0}, timeout=5)
-        self.assertEqual(saved.status_code, 200)
-        report = requests.get(self.url + "/api/report", params={"id": paper_id}, timeout=5).json()
-        self.assertEqual(report["content"], "# Safe\n<script>alert(1)</script>")
-        history = session.get(self.url + "/api/history/report/" + paper_id, timeout=5).json()
-        self.assertEqual(history["versions"][0]["version"], 1)
+        self.assertEqual(saved.status_code, 403)
         self.assertIn("let h=esc(md)", __import__("paperlab_publish.web", fromlist=["HTML"]).HTML)
 
-    def test_add_paper_preview_manual_create_and_duplicate_merge(self):
+    def test_import_is_disabled_even_after_login(self):
         denied = requests.post(self.url + "/api/papers/import/preview",
                                headers={"Content-Type": "application/pdf"}, data=_upload_pdf(), timeout=5)
-        self.assertEqual(denied.status_code, 401)
+        self.assertEqual(denied.status_code, 403)
         session = requests.Session()
         login = session.post(self.url + "/api/auth/login",
                              json={"username": "admin", "password": "correct horse battery staple"}, timeout=5)
@@ -146,33 +142,7 @@ class AuthWebTests(unittest.TestCase):
         no_csrf = session.post(self.url + "/api/papers/import/preview",
                                headers={"Content-Type": "application/pdf"}, data=_upload_pdf(), timeout=5)
         self.assertEqual(no_csrf.status_code, 403)
-        invalid = session.post(self.url + "/api/papers/import/preview", headers=headers,
-                               data=b"not-pdf", timeout=5)
-        self.assertEqual(invalid.status_code, 400)
-        with patch("paperlab_publish.paper_import._llm_fields", return_value={"keywords": "systems, import"}):
-            preview = session.post(self.url + "/api/papers/import/preview", headers=headers,
-                                   data=_upload_pdf(), timeout=5)
-        self.assertEqual(preview.status_code, 200)
-        token = preview.json()["import_token"]
-        json_headers = {"X-CSRF-Token": csrf, "Content-Type": "application/json"}
-        created = session.post(self.url + "/api/papers", headers=json_headers, json={
-            "import_token": token,
-            "fields": {"title": "HTTP Imported Paper", "abstract": "Original", "keywords": "systems"},
-        }, timeout=5)
-        self.assertEqual(created.status_code, 201)
-        self.assertTrue(created.json()["has_pdf"])
-        duplicate = session.post(self.url + "/api/papers", headers=json_headers,
-                                 json={"fields": {"title": "HTTP Imported Paper", "abstract": "Changed"}}, timeout=5)
-        self.assertEqual(duplicate.status_code, 409)
-        merged = session.post(self.url + "/api/papers", headers=json_headers, json={
-            "fields": {"title": "HTTP Imported Paper", "abstract": "Changed", "organizations": "MIT"},
-            "duplicate_action": "fill_missing",
-        }, timeout=5)
-        self.assertEqual(merged.status_code, 200)
-        with Store(self.db, backup_on_migrate=False) as store:
-            row = store.get(created.json()["paper_id"])
-            self.assertEqual(row["abstract"], "Original")
-            self.assertEqual(row["organizations"], "MIT")
+        self.assertEqual(no_csrf.json()["error"], "read_only_server")
 
     def test_http_bidirectional_incremental_sync(self):
         token = "sync-secret"

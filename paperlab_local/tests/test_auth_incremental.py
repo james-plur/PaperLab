@@ -125,15 +125,13 @@ class AuthWebTests(unittest.TestCase):
         self.assertEqual(renamed.status_code, 200)
         self.assertEqual(renamed.json()["name"], "New name")
         paper_id = requests.get(self.url + "/api/papers", timeout=5).json()["papers"][0]["id"]
-        saved = session.put(self.url + "/api/reports/" + paper_id, headers=headers,
+        saved = session.put(self.url + "/api/papers/" + paper_id + "/note", headers=headers,
                             json={"content": "# Safe\n<script>alert(1)</script>", "base_version": 0}, timeout=5)
         self.assertEqual(saved.status_code, 200)
-        report = requests.get(self.url + "/api/report", params={"id": paper_id}, timeout=5).json()
-        self.assertEqual(report["content"], "# Safe\n<script>alert(1)</script>")
-        history = session.get(self.url + "/api/history/report/" + paper_id, timeout=5).json()
-        self.assertEqual(history["versions"][0]["version"], 1)
-        self.assertIn("let h=esc(md)", __import__("paperlab_local.web", fromlist=["HTML"]).HTML)
-
+        note = session.get(self.url + "/api/papers/" + paper_id + "/note", timeout=5).json()
+        self.assertEqual(note["content"], "# Safe\n<script>alert(1)</script>")
+        deprecated = session.get(self.url + "/api/report", params={"id": paper_id}, timeout=5)
+        self.assertEqual(deprecated.status_code, 410)
     def test_add_paper_preview_manual_create_and_duplicate_merge(self):
         denied = requests.post(self.url + "/api/papers/import/preview",
                                headers={"Content-Type": "application/pdf"}, data=_upload_pdf(), timeout=5)

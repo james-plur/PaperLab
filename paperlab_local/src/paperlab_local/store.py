@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 
 
 def normalize_title(title: str) -> str:
@@ -242,6 +242,39 @@ CREATE TABLE IF NOT EXISTS content_versions (
   device_id TEXT NOT NULL,
   UNIQUE(entity_type,entity_id,version)
 );
+CREATE TABLE IF NOT EXISTS paper_activity (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+  action TEXT NOT NULL,
+  details TEXT NOT NULL DEFAULT '{}',
+  occurred_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_paper_activity_time ON paper_activity(occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_paper_activity_paper ON paper_activity(paper_id,occurred_at DESC);
+CREATE TABLE IF NOT EXISTS paper_summaries (
+  paper_id TEXT PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,
+  content TEXT NOT NULL DEFAULT '',
+  abstract_hash TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'none',
+  provider TEXT,
+  model TEXT,
+  error TEXT,
+  generated_at REAL,
+  updated_at REAL NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  updated_by_device TEXT,
+  deleted_at REAL
+);
+CREATE TABLE IF NOT EXISTS paper_notes (
+  paper_id TEXT PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,
+  note_path TEXT NOT NULL,
+  content_hash TEXT NOT NULL DEFAULT '',
+  updated_at REAL NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  updated_by_device TEXT,
+  sync_error TEXT,
+  deleted_at REAL
+);
 """
 
 _V2_COLUMNS = {
@@ -272,6 +305,13 @@ class Store:
         if backup_on_migrate and self._needs_migration():
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             shutil.copy2(self.db_path, self.db_path.with_suffix(f".db.bak-{stamp}"))
+        previous_version = 0
+        if self.db_path.exists() and self.db_path.stat().st_size:
+            probe = sqlite3.connect(self.db_path)
+            try:
+                previous_version = int(probe.execute("PRAGMA user_version").fetchone()[0])
+            finally:
+                probe.close()
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA busy_timeout=10000")
@@ -280,8 +320,26 @@ class Store:
         self.conn.executescript(SCHEMA)
         self._ensure_columns()
         self._migrate_legacy_rows()
+        if previous_version < 11:
+            self._migrate_v11_remove_reports()
         self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self.conn.commit()
+
+    def _migrate_v11_remove_reports(self) -> None:
+        """Remove obsolete machine-generated per-paper reports, never topic reviews."""
+        if not self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_reports'"
+        ).fetchone():
+            return
+        for row in self.conn.execute("SELECT report_path FROM paper_reports WHERE report_path IS NOT NULL"):
+            try:
+                Path(row[0]).unlink(missing_ok=True)
+            except OSError:
+                pass
+        self.conn.execute("DELETE FROM paper_reports")
+        self.conn.execute("DELETE FROM content_versions WHERE entity_type='report'")
+        self.conn.execute("DELETE FROM sync_changes WHERE entity_type='report'")
+        self.conn.execute("DELETE FROM sync_conflicts WHERE entity_type='report'")
 
     def _needs_migration(self) -> bool:
         if not self.db_path.exists() or self.db_path.stat().st_size == 0:
@@ -331,6 +389,56 @@ class Store:
              int(version), device, now, now, now if uploaded else None),
         )
         return cid
+
+    def record_activity(self, paper_id: str, action: str, details: dict | None = None,
+                        *, dedupe_seconds: int = 0) -> None:
+        now = time.time()
+        if dedupe_seconds:
+            recent = self.conn.execute(
+                "SELECT occurred_at FROM paper_activity WHERE paper_id=? AND action=? ORDER BY occurred_at DESC LIMIT 1",
+                (paper_id, action),
+            ).fetchone()
+            if recent and now - float(recent[0]) < dedupe_seconds:
+                return
+        self.conn.execute(
+            "INSERT INTO paper_activity(paper_id,action,details,occurred_at) VALUES (?,?,?,?)",
+            (paper_id, action, json.dumps(details or {}, ensure_ascii=False), now),
+        )
+        self.conn.execute("DELETE FROM paper_activity WHERE occurred_at<?", (now - 180 * 86400,))
+        self.conn.execute(
+            "DELETE FROM paper_activity WHERE id NOT IN (SELECT id FROM paper_activity ORDER BY occurred_at DESC LIMIT 1000)"
+        )
+        self.conn.commit()
+
+    def recent_activity(self, *, limit: int = 50, offset: int = 0,
+                        actions: list[str] | None = None, unique_papers: bool = False) -> list[dict]:
+        where = ""
+        params: list[Any] = []
+        if actions:
+            where = "WHERE a.action IN (" + ",".join("?" for _ in actions) + ")"
+            params.extend(actions)
+        if unique_papers:
+            sql = f"""SELECT * FROM (
+                SELECT a.*,p.title,p.authors,p.venue,p.year,p.pdf_status,
+                       ROW_NUMBER() OVER (PARTITION BY a.paper_id ORDER BY a.occurred_at DESC) AS rn
+                FROM paper_activity a JOIN papers p ON p.id=a.paper_id {where}
+              ) WHERE rn=1 ORDER BY occurred_at DESC LIMIT ? OFFSET ?"""
+        else:
+            sql = f"""SELECT a.*,p.title,p.authors,p.venue,p.year,p.pdf_status
+                FROM paper_activity a JOIN papers p ON p.id=a.paper_id {where}
+                ORDER BY a.occurred_at DESC LIMIT ? OFFSET ?"""
+        params.extend([max(1, min(200, limit)), max(0, offset)])
+        rows = self.conn.execute(sql, params).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item.pop("rn", None)
+            try:
+                item["details"] = json.loads(item.get("details") or "{}")
+            except ValueError:
+                item["details"] = {}
+            result.append(item)
+        return result
 
     def next_server_sequence(self) -> int:
         return int(self.conn.execute(
@@ -956,6 +1064,79 @@ class Store:
     def get_report(self, paper_id: str) -> sqlite3.Row | None:
         return self.conn.execute(
             "SELECT * FROM paper_reports WHERE paper_id=?", (paper_id,)).fetchone()
+
+    def get_summary(self, paper_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM paper_summaries WHERE paper_id=? AND deleted_at IS NULL", (paper_id,)
+        ).fetchone()
+
+    def set_summary(self, paper_id: str, *, content: str, abstract_hash: str,
+                    status: str = "ok", provider: str | None = None,
+                    model: str | None = None, error: str | None = None,
+                    track_change: bool = True) -> sqlite3.Row:
+        now = time.time()
+        existing = self.get_summary(paper_id)
+        current = int(existing["version"] or 1) if existing else 0
+        version = current + 1
+        device = os.environ.get("PAPERLAB_DEVICE_ID", "local")
+        self.conn.execute(
+            """INSERT INTO paper_summaries
+               (paper_id,content,abstract_hash,status,provider,model,error,generated_at,updated_at,version,updated_by_device)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(paper_id) DO UPDATE SET
+               content=excluded.content,abstract_hash=excluded.abstract_hash,status=excluded.status,
+               provider=excluded.provider,model=excluded.model,error=excluded.error,
+               generated_at=excluded.generated_at,updated_at=excluded.updated_at,
+               version=excluded.version,updated_by_device=excluded.updated_by_device,deleted_at=NULL""",
+            (paper_id, content, abstract_hash, status, provider, model, error,
+             now if status == "ok" else None, now, version, device),
+        )
+        if track_change:
+            self.record_change("paper_summary", paper_id, "update", {
+                "content": content, "abstract_hash": abstract_hash, "status": status,
+                "provider": provider, "model": model, "generated_at": now if status == "ok" else None,
+            }, base_version=current, version=version)
+        self.conn.commit()
+        return self.get_summary(paper_id)
+
+    def get_note(self, paper_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM paper_notes WHERE paper_id=? AND deleted_at IS NULL", (paper_id,)
+        ).fetchone()
+
+    def set_note(self, paper_id: str, *, note_path: str, content: str,
+                 base_version: int | None = None, track_change: bool = True) -> sqlite3.Row:
+        encoded = content.encode("utf-8")
+        if len(encoded) > 5 * 1024 * 1024:
+            raise ValueError("note exceeds 5 MB sync limit")
+        existing = self.get_note(paper_id)
+        current = int(existing["version"] or 1) if existing else 0
+        if base_version is not None and int(base_version) != current:
+            raise RuntimeError("version conflict")
+        version = current + 1
+        now = time.time()
+        digest = hashlib.sha256(encoded).hexdigest()
+        device = os.environ.get("PAPERLAB_DEVICE_ID", "local")
+        self.conn.execute(
+            """INSERT INTO paper_notes
+               (paper_id,note_path,content_hash,updated_at,version,updated_by_device,sync_error)
+               VALUES (?,?,?,?,?,?,NULL) ON CONFLICT(paper_id) DO UPDATE SET
+               note_path=excluded.note_path,content_hash=excluded.content_hash,
+               updated_at=excluded.updated_at,version=excluded.version,
+               updated_by_device=excluded.updated_by_device,sync_error=NULL,deleted_at=NULL""",
+            (paper_id, note_path, digest, now, version, device),
+        )
+        self.conn.execute(
+            """INSERT OR REPLACE INTO content_versions
+               (entity_type,entity_id,version,content,content_hash,created_at,device_id)
+               VALUES ('note',?,?,?,?,?,?)""",
+            (paper_id, version, content, digest, now, device),
+        )
+        if track_change:
+            self.record_change("note", paper_id, "update", {
+                "content": content, "content_hash": digest, "updated_at": now,
+            }, base_version=current, version=version)
+        self.conn.commit()
+        return self.get_note(paper_id)
 
     def set_report(self, paper_id: str, *, report_path: str, status: str = "ok",
                    commit: bool = True) -> None:

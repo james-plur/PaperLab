@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 
 
 def normalize_title(title: str) -> str:
@@ -242,6 +242,18 @@ CREATE TABLE IF NOT EXISTS content_versions (
   device_id TEXT NOT NULL,
   UNIQUE(entity_type,entity_id,version)
 );
+CREATE TABLE IF NOT EXISTS paper_summaries (
+  paper_id TEXT PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,
+  content TEXT NOT NULL DEFAULT '', abstract_hash TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'none', provider TEXT, model TEXT, error TEXT,
+  generated_at REAL, updated_at REAL NOT NULL, version INTEGER NOT NULL DEFAULT 1,
+  updated_by_device TEXT, deleted_at REAL
+);
+CREATE TABLE IF NOT EXISTS paper_notes (
+  paper_id TEXT PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,
+  note_path TEXT NOT NULL, content_hash TEXT NOT NULL DEFAULT '', updated_at REAL NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1, updated_by_device TEXT, sync_error TEXT, deleted_at REAL
+);
 """
 
 _V2_COLUMNS = {
@@ -272,6 +284,11 @@ class Store:
         if backup_on_migrate and self._needs_migration():
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             shutil.copy2(self.db_path, self.db_path.with_suffix(f".db.bak-{stamp}"))
+        previous_version = 0
+        if self.db_path.exists() and self.db_path.stat().st_size:
+            probe = sqlite3.connect(self.db_path)
+            try: previous_version = int(probe.execute("PRAGMA user_version").fetchone()[0])
+            finally: probe.close()
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA busy_timeout=10000")
@@ -280,8 +297,21 @@ class Store:
         self.conn.executescript(SCHEMA)
         self._ensure_columns()
         self._migrate_legacy_rows()
+        if previous_version < 11:
+            self._migrate_v11_remove_reports()
         self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self.conn.commit()
+
+    def _migrate_v11_remove_reports(self) -> None:
+        if not self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_reports'").fetchone():
+            return
+        for row in self.conn.execute("SELECT report_path FROM paper_reports WHERE report_path IS NOT NULL"):
+            try: Path(row[0]).unlink(missing_ok=True)
+            except OSError: pass
+        self.conn.execute("DELETE FROM paper_reports")
+        self.conn.execute("DELETE FROM content_versions WHERE entity_type='report'")
+        self.conn.execute("DELETE FROM sync_changes WHERE entity_type='report'")
+        self.conn.execute("DELETE FROM sync_conflicts WHERE entity_type='report'")
 
     def _needs_migration(self) -> bool:
         if not self.db_path.exists() or self.db_path.stat().st_size == 0:

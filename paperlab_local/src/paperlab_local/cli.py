@@ -265,16 +265,10 @@ def cmd_keywords(args, cfg: Config, store: Store) -> None:
         _log(f"Done: {done}/{len(rows)} papers got keywords")
 
 
-def cmd_web(args, cfg: Config, store: Store) -> None:
-    if args.action == "install":
-        path = schedule_mod.install_web(cfg, args.config, host=args.host, port=args.port)
-        _log(f"Web LaunchAgent installed: {path}")
-    elif args.action == "remove":
-        _log("Web LaunchAgent removed" if schedule_mod.remove_web() else "not installed")
-    elif args.action == "status":
-        _log(json.dumps(schedule_mod.web_status(), ensure_ascii=False))
-    else:
-        web_mod.serve(cfg.db_path, host=args.host, port=args.port, config_path=args.config)
+def cmd_app_server(args, cfg: Config, store: Store) -> None:
+    """Run the authenticated loopback sidecar used exclusively by PaperLab.app."""
+    web_mod.serve(cfg.db_path, host="127.0.0.1", port=args.port, config_path=args.config,
+                  app_token=args.app_token)
 
 
 def cmd_stats(args, cfg: Config, store: Store) -> None:
@@ -327,10 +321,18 @@ def cmd_auth(args, cfg: Config, store: Store | None) -> None:
         print(hash_password(first))
 
 
+def _default_config_path() -> str:
+    """Find the Local config in both source checkouts and installed layouts."""
+    candidates = [Path.cwd() / "topics.yaml"]
+    source_root = Path(__file__).resolve().parents[3]
+    candidates.append(source_root / "topics.yaml")
+    candidates.append(Path(__file__).resolve().parent.parent / "topics.yaml")
+    return str(next((path for path in candidates if path.is_file()), candidates[0]))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="paperlab_local", description="AI conference paper database")
-    _default_config = str(Path(__file__).resolve().parent.parent / "topics.yaml")
-    parser.add_argument("--config", "-c", default=_default_config, help="path to config file")
+    parser.add_argument("--config", "-c", default=_default_config_path(), help="path to config file")
     parser.add_argument("--db", default=None, help="override SQLite path")
     sub = parser.add_subparsers(dest="cmd", required=False)
 
@@ -385,13 +387,11 @@ def build_parser() -> argparse.ArgumentParser:
     kw_batch.add_argument("--limit", type=int, default=None)
     kw_batch.set_defaults(func=cmd_keywords, action="batch")
 
-    # web
-    web = sub.add_parser("web", help="serve/manage the Web UI")
-    web.add_argument("action", nargs="?", default="serve",
-                     choices=("serve", "install", "status", "remove"))
-    web.add_argument("--host", default="127.0.0.1")
-    web.add_argument("--port", type=int, default=8765)
-    web.set_defaults(func=cmd_web)
+    # Private sidecar entry point; Electron is the user-facing local launcher.
+    app_server = sub.add_parser("app-server", help=argparse.SUPPRESS)
+    app_server.add_argument("--port", type=int, default=0)
+    app_server.add_argument("--app-token", required=True)
+    app_server.set_defaults(func=cmd_app_server)
 
     # stats
     stats = sub.add_parser("stats")
@@ -439,13 +439,11 @@ def main(argv=None) -> int:
     cfg = load_config(args.config)
     db_path = args.db or str(cfg.db_path)
     if not args.cmd:
-        # No subcommand: default to serving the web UI
-        web_mod.serve(cfg.db_path, host="127.0.0.1", port=8765, config_path=args.config)
-        return 0
+        parser.error("choose a command; launch PaperLab.app for the local interface")
     if args.cmd in {"sync", "auth"}:
         args.func(args, cfg, None)
         return 0
-    if args.cmd in ("web", "schedule") and getattr(args, "action", "") in {"install", "status", "remove"}:
+    if args.cmd == "schedule" and getattr(args, "action", "") in {"install", "status", "remove"}:
         args.func(args, cfg, None)
         return 0
     with Store(db_path) as store:

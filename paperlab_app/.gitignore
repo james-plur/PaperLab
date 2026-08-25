@@ -1,0 +1,7 @@
+node_modules/
+dist/
+renderer-dist/
+release/
+sidecar/
+.sidecar-build/
+*.log

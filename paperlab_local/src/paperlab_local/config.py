@@ -117,6 +117,29 @@ class ScheduleConfig:
     minute: int = 0
 
 
+DEFAULT_COMPANY_ALIASES = {
+    "NVIDIA": ["nvidia", "英伟达"],
+    "ByteDance": ["bytedance", "byte dance", "字节跳动", "字节"],
+    "Microsoft": ["microsoft", "微软"],
+    "OpenAI": ["openai"],
+    "Tencent": ["tencent", "腾讯"],
+    "Alibaba": ["alibaba", "aliyun", "阿里巴巴", "阿里云", "阿里"],
+    "DeepSeek": ["deepseek", "深度求索"],
+    "Anthropic": ["anthropic", "claude"],
+    "Google": ["google", "deepmind", "谷歌"],
+}
+
+
+@dataclasses.dataclass
+class RelatedConfig:
+    primary_source: str = "openalex"
+    fallback_source: str = "semantic_scholar"
+    result_limit: int = 10
+    company_aliases: dict[str, list[str]] = dataclasses.field(
+        default_factory=lambda: {key: list(value) for key, value in DEFAULT_COMPANY_ALIASES.items()}
+    )
+
+
 @dataclasses.dataclass
 class Config:
     models: ModelConfig
@@ -129,6 +152,7 @@ class Config:
     obsidian: ObsidianConfig
     schedule: ScheduleConfig
     pdf_root: Path
+    related: RelatedConfig = dataclasses.field(default_factory=RelatedConfig)
 
     def topic(self, name: str) -> TopicConfig:
         normalized = name.strip().lower()
@@ -248,12 +272,21 @@ def load_config(path: str | Path = "topics.yaml") -> Config:
         hour=int(sched_raw.get("hour", 9)),
         minute=int(sched_raw.get("minute", 0)),
     )
+    related_raw = raw.get("related_papers") or {}
+    aliases_raw = related_raw.get("company_aliases") or DEFAULT_COMPANY_ALIASES
+    related = RelatedConfig(
+        primary_source=str(related_raw.get("primary_source") or "openalex"),
+        fallback_source=str(related_raw.get("fallback_source") or "semantic_scholar"),
+        result_limit=max(1, min(50, int(related_raw.get("result_limit", 10)))),
+        company_aliases={str(key): [str(item) for item in value]
+                         for key, value in aliases_raw.items()},
+    )
 
     db_path = (root / raw.get("db_path", "data/papers.db")).resolve()
     site_raw = raw.get("site_dir")
     site_dir = (root / site_raw).resolve() if site_raw else (papers_root / "site").resolve()
     return Config(
         models=models, topics=topics, root=root, db_path=db_path, site_dir=site_dir,
-        catalog=catalog, mcp=mcp, obsidian=obsidian, schedule=schedule,
+        catalog=catalog, mcp=mcp, obsidian=obsidian, schedule=schedule, related=related,
         pdf_root=papers_root,
     )

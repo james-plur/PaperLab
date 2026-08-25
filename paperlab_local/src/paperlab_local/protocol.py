@@ -1,9 +1,12 @@
 """Local implementation metadata for the wire protocol."""
 
-PROTOCOL_VERSION = "1.0"
-APP_VERSION = "0.3.0"
-SCHEMA_VERSION = 9
-CAPABILITIES = frozenset({"field_merge", "object_chunks", "markdown_history"})
+PROTOCOL_VERSION = "1.1"
+APP_VERSION = "0.4.0"
+SCHEMA_VERSION = 11
+CAPABILITIES = frozenset({
+    "field_merge", "object_chunks", "markdown_history", "paper_summary", "note_sync",
+})
+REQUIRED_CAPABILITIES = frozenset({"paper_summary", "note_sync"})
 
 
 def handshake() -> dict:
@@ -21,4 +24,8 @@ def require_compatible(handshake: dict) -> frozenset[str]:
         raise RuntimeError(
             f"incompatible sync protocol: local {PROTOCOL_VERSION}, remote {remote or 'missing'}"
         )
-    return CAPABILITIES & frozenset(handshake.get("capabilities") or ())
+    available = frozenset(handshake.get("capabilities") or ())
+    missing = REQUIRED_CAPABILITIES - available
+    if missing:
+        raise RuntimeError("sync server must be upgraded; missing capabilities: " + ", ".join(sorted(missing)))
+    return CAPABILITIES & available

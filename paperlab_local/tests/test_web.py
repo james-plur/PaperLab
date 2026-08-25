@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from paperlab_local.store import Store
-from paperlab_local.web import HTML, query_facets, query_papers, reconcile_pdf_paths
+from paperlab_local.web import query_facets, query_papers, reconcile_pdf_paths
 
 
 class TestWebQueries(unittest.TestCase):
@@ -20,14 +20,6 @@ class TestWebQueries(unittest.TestCase):
             self.assertEqual(reconcile_pdf_paths(db, root), 1)
             with Store(db, backup_on_migrate=False) as store:
                 self.assertEqual(Path(store.get(paper_id)["pdf_path"]), target.resolve())
-
-    def test_missing_report_triggers_generation(self):
-        self.assertIn('else if(r.ok&&d.status==="none")', HTML)
-        self.assertIn('await generateReport(id);', HTML)
-        self.assertIn('>Open report</button>', HTML)
-        self.assertIn('>Generate report</button>', HTML)
-        self.assertIn('S.topicReviewAvailable?"Open review":"Generate review"', HTML)
-        self.assertIn('>Regenerate review</button>', HTML)
 
     def test_paginated_search_filters_and_awards(self):
         with tempfile.TemporaryDirectory() as temp:

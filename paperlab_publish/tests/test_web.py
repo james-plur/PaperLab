@@ -21,13 +21,11 @@ class TestWebQueries(unittest.TestCase):
             with Store(db, backup_on_migrate=False) as store:
                 self.assertEqual(Path(store.get(paper_id)["pdf_path"]), target.resolve())
 
-    def test_missing_report_triggers_generation(self):
-        self.assertIn('else if(r.ok&&d.status==="none")', HTML)
-        self.assertIn('await generateReport(id);', HTML)
-        self.assertIn('>Open report</button>', HTML)
-        self.assertIn('>Generate report</button>', HTML)
-        self.assertIn('S.topicReviewAvailable?"Open review":"Generate review"', HTML)
-        self.assertIn('>Regenerate review</button>', HTML)
+    def test_server_ui_is_read_only_and_shows_notes(self):
+        self.assertIn('document.body.classList.add("readonly")', HTML)
+        self.assertIn('>View note</button>', HTML)
+        self.assertIn('/note")', HTML)
+        self.assertNotIn('>Generate report</button>', HTML)
 
     def test_paginated_search_filters_and_awards(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -47,26 +45,29 @@ class TestWebQueries(unittest.TestCase):
             self.assertEqual(result["total"], 1)
             self.assertEqual(result["papers"][0]["venue"], "FAST")
             self.assertIn("kv-cache", result["papers"][0]["topics"])
-            self.assertFalse(result["papers"][0]["has_report"])
+            self.assertFalse(result["papers"][0]["has_note"])
             facets = query_facets(db)
             self.assertEqual(facets["total"], 2)
             self.assertEqual(facets["award_count"], 1)
 
-    def test_report_availability_requires_valid_report_file_not_pdf(self):
+    def test_note_and_summary_availability_are_exposed(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             db = root / "papers.db"
-            report_file = root / "report.md"
-            report_file.write_text("# Report", encoding="utf-8")
+            note_file = root / "note.md"
+            note_file.write_text("# Note", encoding="utf-8")
             with Store(db) as store:
-                ready = store.upsert_candidate({"title": "Ready report"})
-                missing = store.upsert_candidate({"title": "No report"})
-                store.set_report(ready, report_path=str(report_file))
-            ready_result = query_papers(db, {"q": ["Ready report"]})["papers"][0]
-            missing_result = query_papers(db, {"q": ["No report"]})["papers"][0]
-            self.assertTrue(ready_result["has_report"])
+                ready = store.upsert_candidate({"title": "Ready note"})
+                missing = store.upsert_candidate({"title": "No note"})
+                store.conn.execute("INSERT INTO paper_notes(paper_id,note_path,content_hash,updated_at) VALUES (?,?,?,1)",(ready,str(note_file),"hash"))
+                store.conn.execute("INSERT INTO paper_summaries(paper_id,content,abstract_hash,status,updated_at) VALUES (?,?,?,'ok',1)",(ready,"中文概要","hash"))
+                store.conn.commit()
+            ready_result = query_papers(db, {"q": ["Ready note"]})["papers"][0]
+            missing_result = query_papers(db, {"q": ["No note"]})["papers"][0]
+            self.assertTrue(ready_result["has_note"])
+            self.assertEqual(ready_result["summary_zh"], "中文概要")
             self.assertIsNone(ready_result["pdf_path"])
-            self.assertFalse(missing_result["has_report"])
+            self.assertFalse(missing_result["has_note"])
 
 
 if __name__ == "__main__":

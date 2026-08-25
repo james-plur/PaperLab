@@ -24,13 +24,14 @@ class TestParseJson(unittest.TestCase):
 
 
 class TestProviderConfig(unittest.TestCase):
-    def test_zhipu_defaults_and_secret_is_not_returned(self):
+    def test_provider_priority_and_secret_is_not_persisted(self):
         from paperlab_local.llm import public_provider_config, save_provider_config
         with tempfile.TemporaryDirectory() as temp:
             db = Path(temp) / "papers.db"
             initial = public_provider_config(db)
             self.assertEqual(initial["active_provider"], "zhipu")
-            self.assertEqual(initial["providers"]["zhipu"]["model"], "glm-5.2")
+            self.assertEqual(initial["priority"], ["siliconflow", "deepseek", "zhipu"])
+            self.assertEqual(initial["providers"]["zhipu"]["model"], "GLM-4.7-Flash")
             result = save_provider_config(db, {
                 "active_provider": "zhipu",
                 "providers": {"zhipu": {
@@ -38,10 +39,11 @@ class TestProviderConfig(unittest.TestCase):
                     "api_key": "secret-value",
                 }},
             })
-            self.assertTrue(result["providers"]["zhipu"]["has_api_key"])
+            self.assertFalse(result["providers"]["zhipu"]["has_api_key"])
             self.assertNotIn("api_key", result["providers"]["zhipu"])
             stored = json.loads((Path(temp) / "llm_config.json").read_text())
-            self.assertEqual(stored["providers"]["zhipu"]["api_key"], "secret-value")
+            self.assertNotIn("api_key", stored["providers"]["zhipu"])
+            self.assertEqual(stored["schema_version"], 3)
             self.assertEqual(os.stat(Path(temp) / "llm_config.json").st_mode & 0o777, 0o600)
 
     def test_legacy_config_migrates_to_zhipu_and_cc_switch(self):

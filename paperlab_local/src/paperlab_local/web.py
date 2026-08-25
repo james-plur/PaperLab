@@ -95,6 +95,14 @@ def query_papers(db_path, params):
         values.append('%"' + org + '"%')
     if one("award") in {"1", "true", "yes"}:
         clauses.append("p.awards IS NOT NULL AND trim(p.awards) != ''")
+    sort = one("sort", "year_desc")
+    order_by = {
+        "year_desc": "COALESCE(p.year,0) DESC,p.title",
+        "year_asc": "COALESCE(p.year,0),p.title",
+        "citations_desc": "COALESCE(p.citation_count,0) DESC,p.title",
+        "title_asc": "lower(p.title),p.id",
+        "updated_desc": "p.last_updated DESC,p.title",
+    }.get(sort, "COALESCE(p.year,0) DESC,p.title")
     where = " AND ".join(clauses)
     conn = _connect(db_path)
     try:
@@ -102,7 +110,7 @@ def query_papers(db_path, params):
         rows = conn.execute(
             "SELECT " + _paper_select("p") + ","
             "(SELECT group_concat(pt.topic_id || ':' || printf('%.2f',pt.score),'|') FROM paper_topics pt WHERE pt.paper_id=p.id AND pt.relevant=1) topics "
-            "FROM papers p WHERE " + where + " ORDER BY p.year DESC,p.venue,p.title LIMIT ? OFFSET ?",
+            "FROM papers p WHERE " + where + " ORDER BY " + order_by + " LIMIT ? OFFSET ?",
             [*values, per_page, (page - 1) * per_page]).fetchall()
     finally:
         conn.close()
@@ -272,6 +280,19 @@ def update_paper(db_path, paper_id, fields, base_version=None):
         current = int(row["version"] or 1)
         if base_version is not None and int(base_version) != current:
             raise RuntimeError("version conflict")
+        candidate_title = str(fields.get("title", row["title"]) or "").strip()
+        candidate_doi = str(fields.get("doi", row["doi"]) or "").strip().lower()
+        candidate_arxiv = str(fields.get("arxiv_id", row["arxiv_id"]) or "").strip()
+        from .store import _clean_arxiv, title_hash
+        candidate_arxiv = _clean_arxiv(candidate_arxiv) or ""
+        duplicate = conn.execute(
+            """SELECT id,title FROM papers WHERE id!=? AND deleted_at IS NULL AND
+               ((?!='' AND lower(doi)=?) OR (?!='' AND arxiv_id=?) OR norm_title_hash=?) LIMIT 1""",
+            (paper_id, candidate_doi, candidate_doi, candidate_arxiv, candidate_arxiv,
+             title_hash(candidate_title)),
+        ).fetchone()
+        if duplicate:
+            raise ValueError(f"duplicate paper: {duplicate['title']} ({duplicate['id']})")
         sets = []
         vals = []
         changed = {}
@@ -281,6 +302,16 @@ def update_paper(db_path, paper_id, fields, base_version=None):
                 value = fields[k] if fields[k] else None
                 vals.append(value)
                 changed[k] = value
+        if "title" in fields:
+            sets.append("norm_title_hash=?")
+            vals.append(title_hash(candidate_title))
+        if "doi" in fields:
+            changed["doi"] = candidate_doi or None
+            vals[next(i for i, item in enumerate(sets) if item == "doi=?")] = candidate_doi or None
+        if "arxiv_id" in fields:
+            index = next(i for i, item in enumerate(sets) if item == "arxiv_id=?")
+            vals[index] = candidate_arxiv or None
+            changed["arxiv_id"] = candidate_arxiv or None
         if not sets:
             return {"updated": 0}
         sets.append("last_updated=?")
@@ -289,6 +320,7 @@ def update_paper(db_path, paper_id, fields, base_version=None):
         vals.extend([current + 1, os.environ.get("PAPERLAB_DEVICE_ID", "local")])
         vals.append(paper_id)
         conn.execute("UPDATE papers SET " + ",".join(sets) + " WHERE id=?", vals)
+        store.record_activity(paper_id, "metadata_edited", {"fields": sorted(changed)})
         store.record_change("paper", paper_id, "update", changed,
                             base_version=current, version=current + 1)
         conn.commit()
@@ -299,6 +331,8 @@ def update_paper(db_path, paper_id, fields, base_version=None):
 class PaperHandler(BaseHTTPRequestHandler):
     db_path = Path(".")
     config_path = Path(__file__).resolve().parent.parent / "topics.yaml"
+    app_token = ""
+    no_browser_ui = False
 
     def _send(self, body, content_type, status=200, headers=None):
         self.send_response(status)
@@ -311,23 +345,42 @@ class PaperHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy",
                          "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
                          "img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+        if self.app_token:
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "Authorization,Content-Type,X-PaperLab-Provider,X-PaperLab-Model")
+            self.send_header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
         for name, value in (headers or {}).items():
             self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
+    def do_OPTIONS(self):
+        if self.app_token:
+            self._send(b"", "text/plain", 204)
+        else:
+            self._send(b"", "text/plain", 404)
+
     def _trusted_local(self):
         enabled = os.environ.get("PAPERLAB_LOCAL_TRUSTED_MODE", "1").lower() in {"1", "true", "yes"}
         return enabled and self.client_address[0] in {"127.0.0.1", "::1"}
+
+    def _app_authenticated(self):
+        if not self.app_token:
+            return False
+        auth = self.headers.get("Authorization", "")
+        import hmac
+        return auth.startswith("Bearer ") and hmac.compare_digest(auth[7:].strip(), self.app_token)
 
     def _session(self):
         from .auth import AUTH
         return AUTH.from_cookie(self.headers.get("Cookie"))
 
     def _is_admin(self):
-        return self._trusted_local() or self._session() is not None
+        return self._app_authenticated() or self._trusted_local() or self._session() is not None
 
     def _require_admin(self, *, csrf=True):
+        if self._app_authenticated():
+            return True
         if self._trusted_local():
             return True
         session = self._session()
@@ -378,6 +431,15 @@ class PaperHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         try:
+            if parsed.path == "/api/app/health":
+                from .store import SCHEMA_VERSION
+                self._send_json({"status": "ok", "schema_version": SCHEMA_VERSION,
+                                 "app_mode": bool(self.app_token), "capabilities": [
+                                     "tasks", "paper_detail", "pdf_range", "batch_actions"]})
+                return
+            if self.app_token and not self._app_authenticated():
+                self._send_json({"error": "valid app token required"}, 401)
+                return
             object_match = re.fullmatch(r"/api/sync/objects/([0-9a-f]{64})", parsed.path)
             if object_match:
                 if not self._require_device():
@@ -443,11 +505,11 @@ class PaperHandler(BaseHTTPRequestHandler):
                     rows = [dict(r) for r in store.conn.execute(
                         "SELECT * FROM sync_conflicts WHERE status='open' ORDER BY created_at,id")]
                 self._send_json({"conflicts": rows})
-            elif re.fullmatch(r"/api/history/(report|review)/(.+)", parsed.path):
+            elif re.fullmatch(r"/api/history/(note|review)/(.+)", parsed.path):
                 if not self._require_admin(csrf=False):
                     return
                 import urllib.parse as ul
-                match = re.fullmatch(r"/api/history/(report|review)/(.+)", parsed.path)
+                match = re.fullmatch(r"/api/history/(note|review)/(.+)", parsed.path)
                 entity_type, entity_id = match.group(1), ul.unquote(match.group(2))
                 from .store import Store
                 with Store(str(self.db_path), backup_on_migrate=False) as store:
@@ -472,6 +534,55 @@ class PaperHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/papers":
                 self._send(json.dumps(query_papers(self.db_path, parse_qs(parsed.query)), ensure_ascii=False).encode(),
                            "application/json; charset=utf-8")
+            elif re.fullmatch(r"/api/papers/[^/]+/(reading-note|note)", parsed.path):
+                if not self._require_admin(csrf=False):
+                    return
+                import urllib.parse as ul
+                from .config import load_config
+                from .reader import load_note
+                from .store import Store
+                suffix = "/reading-note" if parsed.path.endswith("/reading-note") else "/note"
+                paper_id = ul.unquote(parsed.path[len("/api/papers/"):-len(suffix)])
+                with Store(str(self.db_path), backup_on_migrate=False) as store:
+                    exists = store.get(paper_id)
+                    note = store.get_note(paper_id) if exists else None
+                if not exists:
+                    self._send_json({"error": "paper not found"}, 404)
+                    return
+                cfg = load_config(str(self.config_path))
+                self._send_json({"paper_id": paper_id, "content": load_note(cfg.pdf_root, paper_id),
+                                 "version": int(note["version"]) if note else 0,
+                                 "updated_at": note["updated_at"] if note else None})
+            elif re.fullmatch(r"/api/desktop/papers/[^/]+/note-path", parsed.path):
+                if not self.app_token:
+                    self._send_json({"error": "desktop only"}, 404); return
+                import urllib.parse as ul
+                from .config import load_config
+                from .reader import _note_path
+                paper_id = ul.unquote(parsed.path[len("/api/desktop/papers/"):-len("/note-path")])
+                path = _note_path(load_config(str(self.config_path)).pdf_root, paper_id)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch(exist_ok=True)
+                self._send_json({"path": str(path)})
+            elif re.fullmatch(r"/api/papers/[^/]+/summary", parsed.path):
+                if not self._require_admin(csrf=False):
+                    return
+                import urllib.parse as ul
+                from .store import Store
+                from .summary import public_summary
+                paper_id = ul.unquote(parsed.path[len("/api/papers/"):-len("/summary")])
+                try:
+                    with Store(str(self.db_path), backup_on_migrate=False) as store:
+                        self._send_json(public_summary(store, paper_id))
+                except KeyError:
+                    self._send_json({"error": "paper not found"}, 404)
+            elif re.fullmatch(r"/api/papers/[^/]+", parsed.path):
+                import urllib.parse as ul
+                from .store import Store
+                paper_id = ul.unquote(parsed.path[len("/api/papers/"):])
+                with Store(str(self.db_path), backup_on_migrate=False) as store:
+                    row = store.get(paper_id)
+                self._send_json(_paper_dict(row) if row else {"error": "paper not found"}, 200 if row else 404)
             elif parsed.path == "/api/facets":
                 self._send(json.dumps(query_facets(self.db_path), ensure_ascii=False).encode(),
                           "application/json; charset=utf-8")
@@ -481,13 +592,60 @@ class PaperHandler(BaseHTTPRequestHandler):
                 from .llm import public_provider_config
                 self._send(json.dumps(public_provider_config(self.db_path), ensure_ascii=False).encode(),
                            "application/json; charset=utf-8")
+            elif parsed.path == "/api/llm/models":
+                if not self._require_admin(csrf=False):
+                    return
+                from .llm import list_models
+                provider = parse_qs(parsed.query).get("provider", [""])[0]
+                try:
+                    self._send_json({"provider": provider, "models": list_models(provider, self.db_path)})
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, 502)
+            elif parsed.path == "/api/settings":
+                if not self._require_admin(csrf=False):
+                    return
+                from .app_config import read_settings
+                self._send_json(read_settings(self.config_path))
+            elif parsed.path == "/api/activity":
+                if not self._require_admin(csrf=False):
+                    return
+                params = parse_qs(parsed.query)
+                actions = [item for value in params.get("actions", []) for item in value.split(",") if item]
+                from .store import Store
+                with Store(str(self.db_path), backup_on_migrate=False) as store:
+                    items = store.recent_activity(
+                        limit=int(params.get("limit", ["50"])[0]),
+                        offset=int(params.get("offset", ["0"])[0]), actions=actions or None,
+                        unique_papers=params.get("unique", ["0"])[0] in {"1", "true"},
+                    )
+                self._send_json({"activity": items})
             elif parsed.path == "/api/search":
                 params = parse_qs(parsed.query)
                 results = search_papers(self.db_path, params)
                 self._send(json.dumps({"matches": results, "total": len(results)}, ensure_ascii=False).encode(),
                            "application/json; charset=utf-8")
+            elif re.fullmatch(r"/api/papers/[^/]+/related", parsed.path):
+                if not self._require_admin(csrf=False):
+                    return
+                import urllib.parse as ul
+                from .config import load_config
+                from .related import find_related
+                paper_id = ul.unquote(parsed.path[len("/api/papers/"):-len("/related")])
+                try:
+                    self._send_json(find_related(self.db_path, load_config(str(self.config_path)), paper_id))
+                except LookupError as exc:
+                    self._send_json({"error": str(exc)}, 404)
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, 502)
             elif parsed.path == "/api/topics":
                 self._send_json(self._list_topics())
+            elif parsed.path == "/api/tasks":
+                from .app_tasks import TASKS
+                self._send_json({"tasks": TASKS.list()})
+            elif re.fullmatch(r"/api/tasks/[0-9a-f-]+", parsed.path):
+                from .app_tasks import TASKS
+                task = TASKS.get(parsed.path.rsplit("/", 1)[-1])
+                self._send_json(task or {"error": "task not found"}, 200 if task else 404)
             elif self._topic_route(parsed.path, "papers"):
                 topic_id = self._topic_route(parsed.path, "papers")
                 result = query_collection_papers(self.db_path, topic_id)
@@ -497,13 +655,9 @@ class PaperHandler(BaseHTTPRequestHandler):
             elif self._topic_route(parsed.path):
                 self._serve_topic(self._topic_route(parsed.path))
             elif parsed.path == "/api/report":
-                import urllib.parse as ul
-                pid = ul.unquote(parse_qs(parsed.query).get("id", [""])[0])
-                self._serve_report(pid)
-            elif parsed.path in ("/", "/index.html", "/login"):
-                self._send(HTML.encode(), "text/html; charset=utf-8")
+                self._send_json({"error": "deprecated", "replacement": "paper note and summary"}, 410)
             else:
-                self._send(b"not found", "text/plain; charset=utf-8", 404)
+                self._send_json({"error": "not found"}, 404)
         except Exception as exc:
             print("[web] GET error:", repr(exc), flush=True)
             self._send_json({"error": "internal server error"}, 500)
@@ -607,18 +761,6 @@ class PaperHandler(BaseHTTPRequestHandler):
             if not papers:
                 self._send_json({"error": "topic has no papers"}, 400)
                 return
-            missing = []
-            for paper in papers:
-                report = store.get_report(paper["id"])
-                path = Path(report["report_path"]) if report and report["report_path"] else None
-                if not report or report["status"] != "ok" or not path or not path.is_file():
-                    missing.append({"paper_id": paper["id"], "title": paper["title"]})
-            if missing:
-                self._send_json({
-                    "error": "all papers must have reports before generating a review",
-                    "missing_reports": missing,
-                }, 409)
-                return
         key = (str(Path(self.db_path).resolve()), topic_id)
         with _TOPIC_TASKS_LOCK:
             if key in _TOPIC_TASKS:
@@ -644,13 +786,40 @@ class PaperHandler(BaseHTTPRequestHandler):
         if not pdf.is_file() or pdf.stat().st_size < 1000:
             self._send(b"PDF file missing", "text/plain; charset=utf-8", 404)
             return
-        data = pdf.read_bytes()
-        self.send_response(200)
+        size = pdf.stat().st_size
+        start, end, status = 0, size - 1, 200
+        range_header = self.headers.get("Range", "")
+        match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header)
+        if match:
+            start = int(match.group(1) or 0)
+            end = min(size - 1, int(match.group(2) or size - 1))
+            if start > end or start >= size:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.end_headers()
+                return
+            status = 206
+        length = end - start + 1
+        self.send_response(status)
         self.send_header("Content-Type", "application/pdf")
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(length))
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.send_header("Content-Disposition", 'inline; filename="' + pdf.name + '"')
+        if self.app_token:
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "Authorization,Range")
         self.end_headers()
-        self.wfile.write(data)
+        with pdf.open("rb") as handle:
+            handle.seek(start)
+            remaining = length
+            while remaining:
+                chunk = handle.read(min(1 << 16, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
 
     def _serve_static_file(self, parsed_path):
         import urllib.parse as ul
@@ -715,8 +884,10 @@ class PaperHandler(BaseHTTPRequestHandler):
             from . import report as report_mod
             cfg = load_config(str(self.config_path))
             with Store(str(self.db_path)) as store:
+                store.record_activity(paper_id, "report_started")
                 path = report_mod.generate_report(
                     store, cfg, paper_id, provider=provider, model=model, log=lambda m: None)
+                store.record_activity(paper_id, "report_completed", {"path": str(path)})
             self._send(json.dumps({"status": "ok", "path": path}).encode(), "application/json; charset=utf-8")
         except Exception as exc:
             self._send(json.dumps({"error": str(exc)}).encode(), "application/json", 500)
@@ -823,6 +994,20 @@ class PaperHandler(BaseHTTPRequestHandler):
             if not self._require_admin():
                 return
             data = self._read_json()
+            paper_match = re.fullmatch(r"/api/papers/(.+)", parsed.path)
+            if paper_match and "/" not in paper_match.group(1):
+                import urllib.parse as ul
+                try:
+                    result = update_paper(self.db_path, ul.unquote(paper_match.group(1)),
+                                          data.get("fields", data), data.get("base_version"))
+                except RuntimeError:
+                    self._send_json({"error": "version conflict"}, 409)
+                    return
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, 409)
+                    return
+                self._send_json(result)
+                return
             topic_id = self._topic_route(parsed.path)
             if topic_id:
                 from .store import Store
@@ -846,6 +1031,37 @@ class PaperHandler(BaseHTTPRequestHandler):
     def do_PUT(self):
         parsed = urlparse(self.path)
         try:
+            note_match = re.fullmatch(r"/api/papers/([^/]+)/note", parsed.path)
+            if note_match:
+                if not self._require_admin():
+                    return
+                data = self._read_json(5 * 1024 * 1024 + 4096)
+                import urllib.parse as ul
+                from .config import load_config
+                from .reader import save_note
+                from .store import Store
+                paper_id = ul.unquote(note_match.group(1))
+                content = data.get("content")
+                if not isinstance(content, str):
+                    self._send_json({"error": "content must be a string"}, 400); return
+                if len(content.encode("utf-8")) > 5 * 1024 * 1024:
+                    self._send_json({"error": "note exceeds 5 MB sync limit"}, 413); return
+                cfg = load_config(str(self.config_path))
+                with Store(str(self.db_path), backup_on_migrate=False) as store:
+                    if not store.get(paper_id):
+                        self._send_json({"error": "paper not found"}, 404); return
+                    current = store.get_note(paper_id)
+                    current_version = int(current["version"]) if current else 0
+                    if data.get("base_version") is not None and int(data["base_version"]) != current_version:
+                        self._send_json({"error": "version conflict", "current_version": current_version}, 409); return
+                path = save_note(cfg.pdf_root, paper_id, content)
+                with Store(str(self.db_path), backup_on_migrate=False) as store:
+                    note = store.set_note(paper_id, note_path=str(path), content=content,
+                                          base_version=current_version)
+                    store.record_activity(paper_id, "note_updated", dedupe_seconds=300)
+                self._send_json({"status": "ok", "paper_id": paper_id,
+                                 "version": int(note["version"]), "path": str(path)})
+                return
             object_match = re.fullmatch(r"/api/sync/objects/([0-9a-f]{64})", parsed.path)
             if object_match:
                 if not self._require_device():
@@ -898,8 +1114,7 @@ class PaperHandler(BaseHTTPRequestHandler):
             data = self._read_json()
             match = re.fullmatch(r"/api/reports/(.+)", parsed.path)
             if match:
-                import urllib.parse as ul
-                self._save_markdown("report", ul.unquote(match.group(1)), data.get("content"), data.get("base_version"))
+                self._send_json({"error": "deprecated", "replacement": "paper note"}, 410)
                 return
             topic_id = self._topic_route(parsed.path, "review")
             if topic_id:
@@ -913,6 +1128,9 @@ class PaperHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         try:
+            if self.app_token and not self._app_authenticated():
+                self._send_json({"error": "valid app token required"}, 401)
+                return
             if parsed.path == "/api/papers/import/preview":
                 if not self._require_admin():
                     return
@@ -938,7 +1156,291 @@ class PaperHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json(result)
                 return
+            pdf_match = re.fullmatch(r"/api/papers/(.+)/pdf", parsed.path)
+            if pdf_match:
+                if not self._require_admin():
+                    return
+                import urllib.parse as ul
+                from .paper_import import MAX_PDF_BYTES
+                length = int(self.headers.get("Content-Length", 0))
+                if length <= 0 or length > MAX_PDF_BYTES:
+                    self._send_json({"error": "PDF must be between 1 byte and 50 MB"}, 413)
+                    return
+                content = self.rfile.read(length)
+                if not content.startswith(b"%PDF-"):
+                    self._send_json({"error": "file is not a PDF"}, 415)
+                    return
+                try:
+                    import pymupdf
+                    document = pymupdf.open(stream=content, filetype="pdf")
+                    if document.page_count < 1:
+                        raise ValueError("PDF has no pages")
+                    document.close()
+                except Exception as exc:
+                    self._send_json({"error": "invalid PDF: " + str(exc)}, 400)
+                    return
+                from .config import load_config
+                from .store import Store
+                paper_id = ul.unquote(pdf_match.group(1))
+                cfg = load_config(str(self.config_path))
+                target_dir = cfg.pdf_root / "pdfs"
+                target_dir.mkdir(parents=True, exist_ok=True)
+                safe = re.sub(r"[^A-Za-z0-9._-]+", "_", paper_id)[:150]
+                target = target_dir / (safe + ".pdf")
+                temp = target.with_suffix(".pdf.tmp")
+                temp.write_bytes(content)
+                with Store(str(self.db_path), backup_on_migrate=False) as store:
+                    if not store.get(paper_id):
+                        temp.unlink(missing_ok=True)
+                        self._send_json({"error": "paper not found"}, 404)
+                        return
+                    os.replace(temp, target)
+                    store.set_pdf(paper_id, path=str(target), status="ok")
+                    store.record_activity(paper_id, "pdf_attached", {"size": len(content)})
+                self._send_json({"status": "ok", "paper_id": paper_id, "pdf_path": str(target)})
+                return
             data = self._read_json(5 * 1024 * 1024 if parsed.path == "/api/sync/push" else 2 * 1024 * 1024)
+            if parsed.path == "/api/activity":
+                from .store import Store
+                paper_id = str(data.get("paper_id") or "")
+                action = str(data.get("action") or "viewed")
+                allowed = {"viewed", "reading_started", "imported", "merged", "metadata_edited",
+                           "pdf_attached", "report_started", "report_completed", "note_updated"}
+                if action not in allowed:
+                    self._send_json({"error": "unsupported activity"}, 400)
+                    return
+                with Store(str(self.db_path), backup_on_migrate=False) as store:
+                    if not store.get(paper_id):
+                        self._send_json({"error": "paper not found"}, 404)
+                        return
+                    store.record_activity(paper_id, action, data.get("details"),
+                                          dedupe_seconds=300 if action == "viewed" else 30)
+                self._send_json({"status": "ok"})
+                return
+            pdf_url_match = re.fullmatch(r"/api/papers/(.+)/pdf-url", parsed.path)
+            if pdf_url_match:
+                import urllib.parse as ul
+                from .config import load_config
+                from .paper_import import _download_pdf_url
+                from .store import Store
+                paper_id = ul.unquote(pdf_url_match.group(1))
+                try:
+                    _token, downloaded, warnings = _download_pdf_url(self.db_path, str(data.get("pdf_url") or ""))
+                    cfg = load_config(str(self.config_path))
+                    target_dir = cfg.pdf_root / "pdfs"
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", paper_id)[:150]
+                    target = target_dir / (safe + ".pdf")
+                    os.replace(downloaded, target)
+                    with Store(str(self.db_path), backup_on_migrate=False) as store:
+                        if not store.get(paper_id):
+                            target.unlink(missing_ok=True)
+                            self._send_json({"error": "paper not found"}, 404)
+                            return
+                        store.set_pdf(paper_id, path=str(target), status="ok", pdf_url=str(data.get("pdf_url") or ""))
+                        store.record_activity(paper_id, "pdf_attached", {"url": data.get("pdf_url")})
+                    self._send_json({"status": "ok", "warnings": warnings})
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                return
+            if parsed.path == "/api/settings":
+                from .app_config import save_settings
+                try:
+                    self._send_json(save_settings(self.config_path, data))
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                return
+            if parsed.path == "/api/settings/restore":
+                from .app_config import restore_backup
+                try:
+                    self._send_json(restore_backup(self.config_path, str(data.get("backup") or "")))
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                return
+            if parsed.path == "/api/llm/test":
+                from .llm import test_provider
+                try:
+                    self._send_json(test_provider(str(data.get("provider") or ""), self.db_path))
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, 502)
+                return
+            summary_match = re.fullmatch(r"/api/papers/([^/]+)/summary", parsed.path)
+            if summary_match:
+                if not self._require_admin():
+                    return
+                import urllib.parse as ul
+                from .app_tasks import TASKS
+                paper_id = ul.unquote(summary_match.group(1))
+                def work(update, cancelled):
+                    if cancelled():
+                        return None
+                    from .store import Store
+                    from .summary import generate_summary
+                    update(.2)
+                    with Store(str(self.db_path), backup_on_migrate=False) as store:
+                        result = generate_summary(store, paper_id)
+                    update(.9)
+                    return result
+                self._send_json(TASKS.submit("generate_summary", "生成中文概要", work), 202)
+                return
+            reading_match = re.fullmatch(r"/api/papers/([^/]+)/(reading-note|note|ask)", parsed.path)
+            if reading_match:
+                if not self._require_admin():
+                    return
+                import urllib.parse as ul
+                from .config import load_config
+                from .store import Store
+                paper_id = ul.unquote(reading_match.group(1))
+                with Store(str(self.db_path), backup_on_migrate=False) as store:
+                    row = store.get(paper_id)
+                if not row:
+                    self._send_json({"error": "paper not found"}, 404)
+                    return
+                cfg = load_config(str(self.config_path))
+                if reading_match.group(2) in {"reading-note", "note"}:
+                    from .reader import save_note
+                    content = data.get("content")
+                    if not isinstance(content, str):
+                        self._send_json({"error": "content must be a string"}, 400)
+                        return
+                    if len(content.encode("utf-8")) > 5 * 1024 * 1024:
+                        self._send_json({"error": "note exceeds 5 MB sync limit"}, 413)
+                        return
+                    with Store(str(self.db_path), backup_on_migrate=False) as store:
+                        current_note = store.get_note(paper_id)
+                        current_version = int(current_note["version"]) if current_note else 0
+                    if data.get("base_version") is not None and int(data["base_version"]) != current_version:
+                        self._send_json({"error": "version conflict", "current_version": current_version}, 409)
+                        return
+                    path = save_note(cfg.pdf_root, paper_id, content)
+                    with Store(str(self.db_path), backup_on_migrate=False) as store:
+                        try:
+                            note = store.set_note(paper_id, note_path=str(path), content=content,
+                                                  base_version=data.get("base_version"))
+                        except RuntimeError:
+                            self._send_json({"error": "version conflict"}, 409)
+                            return
+                        except ValueError as exc:
+                            self._send_json({"error": str(exc)}, 413)
+                            return
+                        store.record_activity(paper_id, "note_updated", dedupe_seconds=300)
+                    self._send_json({"status": "ok", "paper_id": paper_id,
+                                     "version": int(note["version"]), "path": str(path)})
+                    return
+                from .reader import ask_pdf
+                try:
+                    result = ask_pdf(self.db_path, dict(row), str(data.get("question") or ""),
+                                     data.get("history") if isinstance(data.get("history"), list) else [])
+                    self._send_json(result)
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, 502)
+                return
+            if parsed.path == "/api/tasks":
+                if not self._require_admin():
+                    return
+                from .app_tasks import TASKS
+                from .config import load_config
+                kind = str(data.get("kind") or "")
+                paper_id = str(data.get("paper_id") or "")
+                cfg = load_config(str(self.config_path))
+                if kind == "download_pdf":
+                    def work(update, cancelled):
+                        if cancelled():
+                            return None
+                        from .store import Store
+                        from . import pipeline
+                        update(.1)
+                        with Store(str(self.db_path)) as store:
+                            count = pipeline.download_single(store, cfg, paper_id, log=lambda _: update(.6))
+                        return {"paper_id": paper_id, "downloaded": bool(count), "url": "/pdf/" + paper_id}
+                    task = TASKS.submit(kind, "Download PDF", work)
+                elif kind in {"generate_summary", "generate_report"}:
+                    def work(update, cancelled):
+                        if cancelled():
+                            return None
+                        from .store import Store
+                        from .summary import generate_summary
+                        update(.1)
+                        with Store(str(self.db_path)) as store:
+                            result = generate_summary(store, paper_id)
+                        update(.9)
+                        return result
+                    task = TASKS.submit("generate_summary", "生成中文概要", work)
+                elif kind == "related_search":
+                    def work(update, cancelled):
+                        if cancelled():
+                            return None
+                        from .related import find_related
+                        update(.2)
+                        return find_related(self.db_path, cfg, paper_id)
+                    task = TASKS.submit(kind, "Find related papers", work)
+                else:
+                    self._send_json({"error": "unsupported task kind"}, 400)
+                    return
+                self._send_json(task, 202)
+                return
+            cancel_match = re.fullmatch(r"/api/tasks/([0-9a-f-]+)/cancel", parsed.path)
+            if cancel_match:
+                if not self._require_admin():
+                    return
+                from .app_tasks import TASKS
+                task = TASKS.cancel(cancel_match.group(1))
+                self._send_json(task or {"error": "task not found"}, 200 if task else 404)
+                return
+            if parsed.path == "/api/papers/batch":
+                if not self._require_admin():
+                    return
+                ids = [str(item) for item in data.get("paper_ids") or []][:500]
+                action = data.get("action")
+                if action == "add_to_topic":
+                    from .store import Store
+                    topic_id = int(data.get("topic_id"))
+                    changed, failed = 0, []
+                    with Store(str(self.db_path), backup_on_migrate=False) as store:
+                        for paper_id in ids:
+                            try:
+                                changed += int(store.add_paper_to_collection(topic_id, paper_id))
+                            except Exception as exc:
+                                failed.append({"paper_id": paper_id, "error": str(exc)})
+                    self._send_json({"changed": changed, "failed": failed})
+                    return
+                self._send_json({"error": "unsupported batch action"}, 400)
+                return
+            if parsed.path == "/api/papers/import/url/preview":
+                if not self._require_admin():
+                    return
+                from .paper_import import ImportError as PaperImportError, preview_pdf_url
+                try:
+                    result = preview_pdf_url(self.db_path, data.get("pdf_url", ""),
+                                             provider=data.get("provider"), model=data.get("model"))
+                except PaperImportError as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                    return
+                self._send_json(result)
+                return
+            if parsed.path == "/api/papers/import/bibtex/preview":
+                if not self._require_admin():
+                    return
+                from .config import load_config
+                from .paper_import import ImportError as PaperImportError, preview_bibtex
+                try:
+                    result = preview_bibtex(self.db_path, data.get("bibtex", ""),
+                                             cfg=load_config(str(self.config_path)))
+                except PaperImportError as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                    return
+                self._send_json(result)
+                return
+            if parsed.path == "/api/papers/import/batch":
+                if not self._require_admin():
+                    return
+                from .config import load_config
+                from .paper_import import finalize_batch
+                cfg = load_config(str(self.config_path))
+                self._send_json(finalize_batch(self.db_path, cfg.pdf_root, data.get("items") or []))
+                return
             if parsed.path == "/api/auth/login":
                 from .auth import AUTH, SESSION_COOKIE
                 session = AUTH.login(str(data.get("username") or ""), str(data.get("password") or ""),
@@ -1038,6 +1540,13 @@ class PaperHandler(BaseHTTPRequestHandler):
                 if result.get("conflict"):
                     self._send_json({"error": "paper already exists", **result}, 409)
                     return
+                result_paper = result.get("paper") or {}
+                activity_id = result_paper.get("id") or result.get("paper_id") or result.get("id")
+                if activity_id:
+                    from .store import Store
+                    with Store(str(self.db_path), backup_on_migrate=False) as activity_store:
+                        activity_store.record_activity(activity_id,
+                                                       "imported" if result.get("created") else "merged")
                 self._send_json(result, 201 if result.get("created") else 200)
             elif parsed.path == "/api/edit":
                 try:
@@ -1099,6 +1608,25 @@ class PaperHandler(BaseHTTPRequestHandler):
         try:
             if not self._require_admin():
                 return
+            pdf_match = re.fullmatch(r"/api/papers/(.+)/pdf", parsed.path)
+            if pdf_match:
+                import urllib.parse as ul
+                from .config import load_config
+                from .store import Store
+                paper_id = ul.unquote(pdf_match.group(1))
+                cfg = load_config(str(self.config_path))
+                with Store(str(self.db_path), backup_on_migrate=False) as store:
+                    paper = store.get(paper_id)
+                    if not paper:
+                        self._send_json({"error": "paper not found"}, 404)
+                        return
+                    old = Path(paper["pdf_path"]).resolve() if paper["pdf_path"] else None
+                    store.set_pdf(paper_id, path=None, status="missing")
+                    store.record_activity(paper_id, "pdf_attached", {"removed": True})
+                if old and old.is_file() and old.is_relative_to(cfg.pdf_root.resolve()):
+                    old.unlink()
+                self._send_json({"status": "ok"})
+                return
             device_match = re.fullmatch(r"/api/sync/devices/([^/]+)", parsed.path)
             if device_match:
                 import urllib.parse as ul
@@ -1146,12 +1674,18 @@ class PaperHandler(BaseHTTPRequestHandler):
         print("[web] " + fmt % args, flush=True)
 
 
-def serve(db_path, host="127.0.0.1", port=8765, config_path=None):
+def serve(db_path, host="127.0.0.1", port=0, config_path=None, *, app_token):
+    if host not in {"127.0.0.1", "::1"}:
+        raise ValueError("the PaperLab App sidecar only listens on loopback")
+    if not app_token:
+        raise ValueError("the PaperLab App sidecar requires an app token")
     import socketserver as _ss
     _ss.TCPServer.allow_reuse_address = True
     handler = type("ConfiguredPaperHandler", (PaperHandler,), {
         "db_path": Path(db_path),
         "config_path": Path(config_path).resolve() if config_path else PaperHandler.config_path,
+        "app_token": str(app_token or ""),
+        "no_browser_ui": True,
     })
     server = ThreadingHTTPServer((host, port), handler)
     # Recovery belongs to startup, never to a public GET request.
@@ -1164,6 +1698,10 @@ def serve(db_path, host="127.0.0.1", port=8765, config_path=None):
     cleanup_previews(db_path)
     from .store import Store
     with Store(str(db_path), backup_on_migrate=False) as store:
+        from .reader import reconcile_notes
+        reconciled_notes = reconcile_notes(store, cfg.pdf_root)
+        if reconciled_notes:
+            print(f"PaperLab registered {reconciled_notes} Markdown note(s) for sync", flush=True)
         store.conn.execute(
             """UPDATE topic_reviews SET status='error',stage='interrupted',
                error='previous review generation was interrupted; retry generation',updated_at=?
@@ -1171,7 +1709,8 @@ def serve(db_path, host="127.0.0.1", port=8765, config_path=None):
         )
         store.conn.commit()
         store.run_sync_maintenance()
-    if os.environ.get("PAPERLAB_SYNC_URL") and os.environ.get("PAPERLAB_DEVICE_TOKEN"):
+    auto_sync = os.environ.get("PAPERLAB_AUTO_SYNC", "1").lower() not in {"0", "false", "no", "off"}
+    if auto_sync and os.environ.get("PAPERLAB_SYNC_URL") and os.environ.get("PAPERLAB_DEVICE_TOKEN"):
         def sync_loop():
             from .config import load_config
             from .incremental import sync_now
@@ -1190,455 +1729,13 @@ def serve(db_path, host="127.0.0.1", port=8765, config_path=None):
                         store.conn.commit()
                 time.sleep(60)
         threading.Thread(target=sync_loop, daemon=True).start()
-    print("PaperLab Web: http://{}:{} ({})".format(host, port, db_path), flush=True)
+    actual_port = int(server.server_address[1])
+    print("PAPERLAB_READY " + json.dumps({"host": host, "port": actual_port,
+                                           "app_mode": bool(app_token)}), flush=True)
+    print("PaperLab Web: http://{}:{} ({})".format(host, actual_port, db_path), flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
-
-
-HTML = r"""<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>PaperLab</title>
-<style>
-:root{--bg:#f5f6f8;--card:#fff;--ink:#18202a;--muted:#68717d;--line:#dfe3e8;--accent:#176b5b}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,sans-serif}
-header{position:sticky;top:0;z-index:3;background:#ffffffed;border-bottom:1px solid var(--line);padding:14px 20px;backdrop-filter:blur(8px)}
-.bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;max-width:1500px;margin:auto}h1{font-size:19px;margin:0 12px 0 0}
-input,select,button,textarea{font:inherit;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:#fff}input{flex:1;min-width:200px}button{cursor:pointer}.stat{color:var(--muted)}
-.layout{display:grid;grid-template-columns:240px minmax(0,1fr);max-width:1740px;margin:auto}.sidebar{position:sticky;top:69px;height:calc(100vh - 69px);padding:18px 12px;border-right:1px solid var(--line);background:#fff;overflow:auto}.sidebar-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}.sidebar h2{font-size:15px;margin:0}.topic-item{display:flex;align-items:center;gap:6px;padding:8px;border-radius:8px;cursor:pointer}.topic-item:hover,.topic-item.active{background:#edf2f1}.topic-name{flex:1;overflow:hidden;text-overflow:ellipsis}.topic-count{color:var(--muted);font-size:12px}.topic-delete{border:0;background:transparent;color:#9b3b3b;padding:2px 5px}.home-link{margin-bottom:10px;font-weight:600}main{max-width:1500px;width:100%;margin:16px auto;padding:0 20px}.paper{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:10px 0}
-.title{font-size:16px;font-weight:650}.meta,.authors,.orgs{color:var(--muted);margin-top:5px}.abstract{margin:10px 0 0;max-width:1200px}
-.chip{display:inline-block;background:#edf2f1;border-radius:12px;padding:2px 8px;margin-right:5px;font-size:12px}
-.kw-chip{background:#e8f0fe;color:#1a5276;cursor:pointer}.kw-chip:hover{background:#d0e0fc}
-a{color:var(--accent);text-decoration:none}.pager{display:flex;justify-content:center;align-items:center;gap:12px;margin:22px}.empty{text-align:center;color:var(--muted);padding:60px}
-.link-btn{display:inline-block;background:#e9ecef;color:var(--ink);padding:4px 10px;border-radius:6px;font-size:13px;text-decoration:none;cursor:pointer;margin-left:6px}.link-btn:hover{background:#dee2e6}
-.dl-btn{background:var(--accent);color:#fff;border:none;padding:4px 10px;border-radius:6px;font-size:13px;cursor:pointer;margin-left:6px}.dl-btn:hover{opacity:.85}.dl-btn:disabled{opacity:.5}
-.edit-btn{background:#6c757d;color:#fff;border:none;padding:4px 10px;border-radius:6px;font-size:13px;cursor:pointer;margin-left:6px}
-.mode-btn{background:#e9ecef;border:none;padding:6px 14px;border-radius:8px;cursor:pointer;font-size:13px}.mode-btn.active{background:var(--accent);color:#fff}
-.modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.4);z-index:100}.modal-overlay.show{display:flex;justify-content:center;align-items:center}
-.modal{background:#fff;border-radius:12px;padding:24px;max-width:700px;width:90%;max-height:85vh;overflow-y:auto}
-.modal h2{margin:0 0 16px}.modal label{display:block;margin:8px 0 4px;font-weight:600;font-size:13px;color:var(--muted)}
-.modal input,.modal textarea,.modal select{width:100%;margin-bottom:8px}.modal-actions{display:flex;gap:10px;margin-top:16px;justify-content:flex-end}
-.btn-save{background:var(--accent);color:#fff;border:none;padding:8px 20px;border-radius:8px;cursor:pointer}.btn-cancel{background:#e9ecef;border:none;padding:8px 20px;border-radius:8px;cursor:pointer}
-.kw-edit-input{font-size:12px;padding:2px 6px;border:1px solid var(--accent);border-radius:4px;width:100%}
-.report-btn{background:#2e4a8b;color:#fff;border:none;padding:4px 10px;border-radius:6px;font-size:13px;cursor:pointer;margin-left:6px}.report-btn:hover{opacity:.85}.report-btn:disabled{opacity:.4}
-.report-modal{background:#fff;border-radius:12px;padding:28px;max-width:900px;width:92%;max-height:88vh;overflow-y:auto;line-height:1.7}
-.report-modal h1{font-size:20px;margin:0 0 4px}.report-modal h2{font-size:17px;margin:18px 0 8px;color:#176b5b}.report-modal h3{font-size:15px;margin:14px 0 6px}
-.report-modal p,.report-modal li{font-size:14px;margin:6px 0}.report-modal code{background:#f0f0f0;padding:1px 4px;border-radius:3px;font-size:13px}.report-modal pre{background:#f6f8fa;padding:12px;border-radius:8px;overflow-x:auto}
-.report-modal .modal-actions{margin-top:20px}
-.topic-header{display:flex;align-items:center;gap:12px;background:#fff;border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:12px}.topic-header h2{margin:0;flex:1}.review-status{color:var(--muted);margin:8px 0}.topic-review{background:#fff;border:1px solid var(--line);border-radius:10px;padding:20px;margin:12px 0}.add-topic-btn{background:#8a5b18;color:#fff;border:0;padding:4px 10px;margin-left:6px}.remove-topic-btn{background:#9b3b3b;color:#fff;border:0;padding:4px 10px;margin-left:6px}
-.readonly .admin-only{display:none!important}.markdown-editor{width:100%;min-height:360px;font-family:ui-monospace,SFMono-Regular,monospace}.auth-status{margin-left:auto}
-@media(max-width:800px){.layout{grid-template-columns:1fr}.sidebar{position:static;height:auto;border-right:0;border-bottom:1px solid var(--line)}header{position:static}}
-</style></head><body>
-<header><div class="bar"><h1>PaperLab</h1>
-<input id="q" placeholder="Search: title, author, abstract, keywords... (Enter for semantic search)">
-<select id="venue"><option value="">All venues</option></select>
-<select id="year"><option value="">All years</option></select>
-<select id="org"><option value="">All orgs</option></select>
-<span id="stat" class="stat"></span>
-<button id="addPaperButton" class="admin-only" onclick="openAddPaper()">Add Paper</button>
-<button id="llmSettings" class="admin-only" title="Report model settings">LLM Settings</button>
-<button id="syncButton" class="admin-only">Sync</button>
-<button id="authButton" class="auth-status">Admin login</button>
-</div></header>
-<div class="layout"><aside class="sidebar"><div class="home-link topic-item" onclick="showLibrary()">All Papers</div><div class="sidebar-head"><h2>Topics</h2><button class="admin-only" onclick="createTopic()" title="New topic">＋</button></div><div id="topicList"></div></aside>
-<main><section id="topicHeader" class="topic-header" style="display:none"><h2 id="topicTitle"></h2><button class="edit-btn admin-only" onclick="renameTopic()">Rename</button><button id="reviewButton" class="btn-save admin-only" onclick="topicReviewAction()">Generate review</button></section><div id="reviewStatus" class="review-status"></div><section id="topicReview" class="topic-review" style="display:none"></section><div id="papers"></div>
-<div class="pager"><button id="prev">Prev</button><span id="page"></span><button id="next">Next</button></div>
-</main></div>
-<div class="modal-overlay" id="editModal">
-<div class="modal">
-<h2>Edit Paper</h2>
-<input type="hidden" id="edit-id">
-<label>Title</label><textarea id="edit-title" rows="2"></textarea>
-<label>Authors</label><input id="edit-authors" type="text">
-<label>Organizations</label><input id="edit-organizations" type="text">
-<label>Abstract</label><textarea id="edit-abstract" rows="6"></textarea>
-<label>Keywords (comma-separated)</label><input id="edit-keywords" type="text">
-<label>DOI</label><input id="edit-doi" type="text">
-<label>arXiv ID</label><input id="edit-arxiv_id" type="text">
-<label>Source URL</label><input id="edit-source_url" type="text">
-<label>PDF URL</label><input id="edit-pdf_url" type="text">
-<label>Awards</label><input id="edit-awards" type="text">
-<div class="modal-actions">
-<button class="btn-cancel" onclick="closeModal()">Cancel</button>
-<button class="btn-save" onclick="savePaper()">Save</button>
-</div>
-</div>
-</div>
-<div class="modal-overlay" id="llmModal">
-<div class="modal">
-<h2>Report model</h2>
-<label for="llm-provider">Provider</label>
-<select id="llm-provider" aria-label="Provider"><option value="zhipu">Zhipu GLM</option><option value="cc_switch">CC Switch</option></select>
-<label for="llm-model">Model</label><input id="llm-model" aria-label="Model" type="text" autocomplete="off">
-<label for="llm-base-url">Base URL</label><input id="llm-base-url" aria-label="Base URL" type="url" autocomplete="off">
-<label for="llm-api-key">API key</label><input id="llm-api-key" aria-label="API key" type="password" autocomplete="new-password" placeholder="Leave empty to keep the current key">
-<div id="llm-key-status" class="stat"></div>
-<div class="modal-actions">
-<button class="btn-cancel" onclick="closeLLMSettings()">Cancel</button>
-<button class="btn-save" onclick="saveLLMSettings()">Save</button>
-</div>
-</div>
-</div>
-<div class="modal-overlay" id="reportModal">
-<div class="modal report-modal">
-<div id="reportLoading" style="text-align:center;padding:40px;color:var(--muted)">Generating report, please wait...</div>
-<div id="reportContent" style="display:none"></div>
-<div class="modal-actions">
-<button class="btn-cancel" onclick="closeReport()">Close</button>
-</div>
-</div>
-</div>
-<div class="modal-overlay" id="topicModal"><div class="modal"><h2>Add to topic</h2><input type="hidden" id="topic-paper-id"><div id="topicChoices"></div><div class="modal-actions"><button class="btn-cancel" onclick="closeTopicPicker()">Close</button></div></div></div>
-<div class="modal-overlay" id="createTopicModal"><div class="modal"><h2>New topic</h2><label for="new-topic-name">Name</label><input id="new-topic-name" type="text" maxlength="120"><div class="modal-actions"><button class="btn-cancel" onclick="closeCreateTopic()">Cancel</button><button class="btn-save" onclick="submitCreateTopic()">Create</button></div></div></div>
-<div class="modal-overlay" id="loginModal"><div class="modal"><h2>Administrator login</h2><label for="admin-username">Username</label><input id="admin-username" value="admin" autocomplete="username"><label for="admin-password">Password</label><input id="admin-password" type="password" autocomplete="current-password"><div id="loginError" class="review-status"></div><div class="modal-actions"><button class="btn-cancel" onclick="closeLogin()">Cancel</button><button class="btn-save" onclick="login()">Login</button></div></div></div>
-<div class="modal-overlay" id="addPaperModal"><div class="modal report-modal"><h2>Add Paper</h2>
-<label for="importPdf">Upload PDF (optional, maximum 50 MB)</label><input id="importPdf" type="file" accept="application/pdf,.pdf"><button class="btn-save" id="parsePdfButton" onclick="parseImportPdf()">Parse PDF</button>
-<div id="importStatus" class="review-status"></div><div id="importDuplicate" class="paper" style="display:none"></div>
-<label for="import-title">Title *</label><textarea id="import-title" rows="2"></textarea>
-<label><input class="import-overwrite" data-field="authors" type="checkbox" style="width:auto"> overwrite existing · Authors</label><input id="import-authors" aria-label="Authors">
-<label><input class="import-overwrite" data-field="organizations" type="checkbox" style="width:auto"> overwrite existing · Organizations</label><input id="import-organizations" aria-label="Organizations">
-<label><input class="import-overwrite" data-field="abstract" type="checkbox" style="width:auto"> overwrite existing · Abstract</label><textarea id="import-abstract" aria-label="Abstract" rows="7"></textarea>
-<label><input class="import-overwrite" data-field="keywords" type="checkbox" style="width:auto"> overwrite existing · Keywords</label><input id="import-keywords">
-<label><input class="import-overwrite" data-field="doi" type="checkbox" style="width:auto"> overwrite existing · DOI</label><input id="import-doi">
-<label><input class="import-overwrite" data-field="arxiv_id" type="checkbox" style="width:auto"> overwrite existing · arXiv ID</label><input id="import-arxiv_id">
-<label><input class="import-overwrite" data-field="venue" type="checkbox" style="width:auto"> overwrite existing · Venue</label><input id="import-venue">
-<label><input class="import-overwrite" data-field="year" type="checkbox" style="width:auto"> overwrite existing · Year</label><input id="import-year" type="number" min="1900" max="2100">
-<label><input class="import-overwrite" data-field="source_url" type="checkbox" style="width:auto"> overwrite existing · Source URL</label><input id="import-source_url" type="url">
-<label><input class="import-overwrite" data-field="pdf_url" type="checkbox" style="width:auto"> overwrite existing · PDF URL</label><input id="import-pdf_url" type="url">
-<div class="modal-actions"><button class="btn-cancel" onclick="closeAddPaper()">Cancel</button><button class="btn-save" id="saveImportButton" onclick="saveImportedPaper()">Save Paper</button></div>
-</div></div>
-<div class="modal-overlay" id="markdownModal"><div class="modal report-modal"><h2 id="markdownTitle">Edit Markdown</h2><textarea id="markdownContent" class="markdown-editor"></textarea><details><summary>Version history</summary><div id="historyList"></div></details><div class="modal-actions"><button class="btn-cancel" onclick="closeMarkdownEditor()">Cancel</button><button class="btn-save" onclick="previewMarkdown()">Preview</button><button class="btn-save" onclick="saveMarkdown()">Save</button></div><div id="markdownPreview" class="topic-review" style="display:none"></div></div></div>
-<div class="modal-overlay" id="syncModal"><div class="modal report-modal"><h2>Synchronization</h2><div id="syncStatus" class="stat">Loading…</div><h3>Open conflicts</h3><div id="conflictList"></div><h3>Register local device</h3><input id="deviceName" placeholder="MacBook"><div class="modal-actions"><button class="btn-cancel" onclick="closeSync()">Close</button><button class="btn-save" onclick="registerDevice()">Create device token</button></div><pre id="deviceToken" style="display:none"></pre></div></div>
-<script>
-function openInEditor(path){fetch("/api/open_file",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:path})}).catch(function(){alert("Could not open file: "+path)});}
-const S={page:1,pages:1,mode:"library",llm:null,topics:[],activeTopic:null,reviewTimer:null,visiblePapers:[],topicReviewAvailable:false,admin:false,csrf:null,markdown:null,importToken:null,importDuplicate:null};
-const $=id=>document.getElementById(id);
-const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const nativeFetch=window.fetch.bind(window);window.fetch=(url,opts={})=>{opts={...opts};const method=(opts.method||"GET").toUpperCase();if(method!=="GET"&&S.csrf){opts.headers={...(opts.headers||{}),"X-CSRF-Token":S.csrf};}return nativeFetch(url,opts);};
-async function loadSession(){const d=await nativeFetch("/api/auth/session").then(r=>r.json());S.admin=!!d.authenticated;S.csrf=d.csrf_token||null;document.body.classList.toggle("readonly",!S.admin);$("authButton").textContent=S.admin?(d.trusted_local?"Local admin":"Logout"):"Admin login";}
-function closeLogin(){$("loginModal").classList.remove("show");}
-async function login(){const r=await nativeFetch("/api/auth/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:$("admin-username").value,password:$("admin-password").value})});const d=await r.json();if(!r.ok){$("loginError").textContent=d.error||"Login failed";return;}S.csrf=d.csrf_token;closeLogin();await loadSession();await loadTopics();load(true);}
-async function authAction(){if(!S.admin){$("admin-password").value="";$("loginError").textContent="";$("loginModal").classList.add("show");return;}if($("authButton").textContent==="Local admin")return;await fetch("/api/auth/logout",{method:"POST"});S.csrf=null;await loadSession();load(true);}
-const importFields=["title","authors","organizations","abstract","keywords","doi","arxiv_id","venue","year","source_url","pdf_url"];
-function importValues(){const values={};importFields.forEach(f=>values[f]=$("import-"+f).value.trim());if(values.year)values.year=Number(values.year);return values;}
-function fillImport(values){importFields.forEach(f=>{$("import-"+f).value=(values&&values[f])||"";});}
-function showImportDuplicate(p){S.importDuplicate=p||null;const box=$("importDuplicate");if(!p){box.style.display="none";box.innerHTML="";return;}box.style.display="block";box.innerHTML="<b>Existing paper found:</b> "+esc(p.title)+"<br><span class=\"stat\">Unchecked fields only fill missing values. Check a field to overwrite its existing value.</span>";}
-function openAddPaper(){S.importToken=null;S.importDuplicate=null;fillImport({});$("importPdf").value="";$("importStatus").textContent="";showImportDuplicate(null);document.querySelectorAll(".import-overwrite").forEach(x=>x.checked=false);$("addPaperModal").classList.add("show");}
-function closeAddPaper(){$("addPaperModal").classList.remove("show");}
-async function parseImportPdf(){const file=$("importPdf").files[0];if(!file){$("importStatus").textContent="Choose a PDF first.";return;}if(file.size>50*1024*1024){$("importStatus").textContent="PDF exceeds 50 MB.";return;}const button=$("parsePdfButton");button.disabled=true;$("importStatus").textContent="Parsing PDF…";try{if(!S.llm)await loadLLMConfig();const active=S.llm&&S.llm.active_provider;const headers={"Content-Type":"application/pdf","X-PaperLab-Filename":file.name};if(active){headers["X-PaperLab-Provider"]=active;headers["X-PaperLab-Model"]=S.llm.providers[active].model;}const r=await fetch("/api/papers/import/preview",{method:"POST",headers,body:file});const d=await r.json();if(!r.ok)throw new Error(d.error||"PDF parsing failed");S.importToken=d.import_token;fillImport(d.fields||{});showImportDuplicate(d.duplicate);$("importStatus").textContent=(d.warnings||[]).join(" ")||"PDF parsed. Review fields before saving.";}catch(e){$("importStatus").textContent=e.message;}finally{button.disabled=false;}}
-async function saveImportedPaper(){const fields=importValues();if(!fields.title){$("importStatus").textContent="Title is required.";return;}const checked=[...document.querySelectorAll(".import-overwrite:checked")].map(x=>x.dataset.field);const body={fields,import_token:S.importToken};if(S.importDuplicate){body.duplicate_action=checked.length?"overwrite_fields":"fill_missing";body.overwrite_fields=checked;}const button=$("saveImportButton");button.disabled=true;try{const r=await fetch("/api/papers",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});const d=await r.json();if(r.status===409&&d.conflict){showImportDuplicate(d.conflict);$("importStatus").textContent="This paper already exists. Review the merge options, then save again.";return;}if(!r.ok)throw new Error(d.error||"Import failed");closeAddPaper();showLibrary();$("q").value=fields.title;await load(true);}catch(e){$("importStatus").textContent=e.message;}finally{button.disabled=false;}}
-async function openSync(){$("syncModal").classList.add("show");const [status,conflicts]=await Promise.all([fetch("/api/sync/status").then(r=>r.json()),fetch("/api/sync/conflicts").then(r=>r.json())]);$("syncStatus").textContent="Sequence "+status.latest_sequence+" · "+status.devices.length+" devices · "+status.pending_uploads+" pending uploads · "+status.open_conflicts+" conflicts"+(status.last_success?" · last sync "+new Date(status.last_success*1000).toLocaleString():"")+(status.last_error?" · error: "+status.last_error:"");$("conflictList").innerHTML=(conflicts.conflicts||[]).map(c=>'<div class="paper"><b>'+esc(c.entity_type+" · "+c.entity_id+" · "+c.field)+'</b><div class="modal-actions"><button onclick="resolveConflict('+c.id+',\'local\')">Keep local</button><button onclick="resolveConflict('+c.id+',\'remote\')">Use remote</button></div></div>').join("")||'<div class="stat">No open conflicts</div>';}
-function closeSync(){$("syncModal").classList.remove("show");}
-async function registerDevice(){const r=await fetch("/api/sync/devices",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:$("deviceName").value||"Local device"})});const d=await r.json();if(!r.ok){alert(d.error||"Could not create device");return;}$("deviceToken").textContent="Device ID: "+d.device_id+"\nToken (shown once): "+d.token;$("deviceToken").style.display="block";openSync();}
-async function resolveConflict(id,strategy){const r=await fetch("/api/sync/conflicts/"+id+"/resolve",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({strategy})});if(!r.ok){alert("Could not resolve conflict");return;}openSync();}
-async function facets(){
-  const f=await fetch("/api/facets").then(r=>r.json());
-  for(const v of f.venues) $("venue").insertAdjacentHTML("beforeend","<option>"+esc(v)+"</option>");
-  for(const y of f.years) $("year").insertAdjacentHTML("beforeend","<option>"+y+"</option>");
-  for(const o of f.orgs||[]) $("org").insertAdjacentHTML("beforeend","<option>"+esc(o)+"</option>");
-  $("stat").textContent=f.total.toLocaleString()+" papers";
-}
-async function loadLLMConfig(){
-  if(!S.admin)return null;
-  const r=await fetch("/api/llm/config");
-  const d=await r.json();
-  if(!r.ok)throw new Error(d.error||"Could not load LLM settings");
-  S.llm=d;
-  const active=d.providers[d.active_provider];
-  $("llmSettings").textContent="LLM: "+active.label;
-  return d;
-}
-function showLLMProvider(){
-  const name=$("llm-provider").value;
-  const p=S.llm.providers[name];
-  $("llm-model").value=p.model||"";
-  $("llm-base-url").value=p.base_url||"";
-  $("llm-api-key").value="";
-  $("llm-key-status").textContent=p.has_api_key?"API key configured":"API key required";
-}
-async function openLLMSettings(){
-  try{
-    await loadLLMConfig();
-    $("llm-provider").value=S.llm.active_provider;
-    showLLMProvider();
-    $("llmModal").classList.add("show");
-  }catch(e){alert(e.message);}
-}
-function closeLLMSettings(){$("llmModal").classList.remove("show");}
-async function saveLLMSettings(){
-  const name=$("llm-provider").value;
-  const provider={model:$("llm-model").value,base_url:$("llm-base-url").value};
-  if($("llm-api-key").value)provider.api_key=$("llm-api-key").value;
-  const payload={active_provider:name,providers:{}};payload.providers[name]=provider;
-  try{
-    const r=await fetch("/api/llm/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
-    const d=await r.json();
-    if(!r.ok)throw new Error(d.error||"Save failed");
-    S.llm=d;closeLLMSettings();await loadLLMConfig();
-  }catch(e){alert("Error: "+e.message);}
-}
-async function loadTopics(){
-  const d=await fetch("/api/topics").then(r=>r.json());
-  S.topics=d.topics||[];
-  $("topicList").innerHTML=S.topics.length?S.topics.map(t=>'<div class="topic-item '+(S.activeTopic===t.id?'active':'')+'" onclick="openTopic('+t.id+')"><span class="topic-name">'+esc(t.name)+'</span><span class="topic-count">'+t.paper_count+'</span>'+(S.admin?'<button class="topic-delete" title="Delete" onclick="event.stopPropagation();deleteTopic('+t.id+')">×</button>':'')+'</div>').join(""):'<div class="stat">No topics yet</div>';
-}
-function createTopic(){$("new-topic-name").value="";$("createTopicModal").classList.add("show");$("new-topic-name").focus();}
-function closeCreateTopic(){$("createTopicModal").classList.remove("show");}
-async function submitCreateTopic(){
-  const name=$("new-topic-name").value;
-  const r=await fetch("/api/topics",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name})});
-  const d=await r.json();if(!r.ok){alert(d.error||"Could not create topic");return;}closeCreateTopic();await loadTopics();openTopic(d.id);
-}
-async function deleteTopic(id){
-  const found=S.topics.find(t=>t.id===id);const name=found?found.name:"topic";
-  if(!confirm('Delete topic "'+name+'"? Papers and their reports will be kept.'))return;
-  const r=await fetch("/api/topics/"+id,{method:"DELETE"});const d=await r.json();
-  if(!r.ok){alert(d.error||"Delete failed");return;}if(S.activeTopic===id)showLibrary();await loadTopics();
-}
-function showLibrary(){
-  S.mode="library";S.activeTopic=null;clearInterval(S.reviewTimer);S.reviewTimer=null;
-  S.topicReviewAvailable=false;
-  $("topicHeader").style.display="none";$("topicReview").style.display="none";$("reviewStatus").textContent="";
-  ["q","venue","year","org"].forEach(id=>$(id).disabled=false);loadTopics();load(true);
-}
-async function openTopic(id){
-  S.mode="topic";S.activeTopic=id;S.topicReviewAvailable=false;clearInterval(S.reviewTimer);S.reviewTimer=null;
-  ["q","venue","year","org"].forEach(x=>$(x).disabled=true);
-  const r=await fetch("/api/topics/"+id+"/papers");const d=await r.json();
-  if(S.mode!=="topic"||S.activeTopic!==id)return;
-  if(!r.ok){alert(d.error||"Topic could not be loaded");showLibrary();return;}
-  $("topicTitle").textContent=d.topic.name+" ("+d.total+")";$("topicHeader").style.display="flex";
-  S.visiblePapers=d.papers;$("papers").innerHTML=d.papers.length?d.papers.map(card).join(""):'<div class="empty">This topic has no papers</div>';
-  $("page").textContent=d.total+" papers";$("prev").disabled=true;$("next").disabled=true;
-  await loadTopics();await pollTopicReview();window.scrollTo({top:0});
-}
-function openTopicPickerById(id){const p=S.visiblePapers.find(x=>x.id===id);if(p)openTopicPicker(p);}
-function openTopicPicker(p){
-  $("topic-paper-id").value=p.id;const ids=String(p.collection_topic_ids||"").split(",").filter(Boolean).map(Number);
-  $("topicChoices").innerHTML=S.topics.length?S.topics.map(t=>'<label style="display:flex;gap:8px;align-items:center"><input style="width:auto" type="checkbox" '+(ids.includes(t.id)?'checked':'')+' onchange="togglePaperTopic('+t.id+','+JSON.stringify(p.id).replace(/"/g,'&quot;')+',this.checked)">'+esc(t.name)+'</label>').join(""):'<div class="stat">Create a topic from the sidebar first.</div>';
-  $("topicModal").classList.add("show");
-}
-function closeTopicPicker(){$("topicModal").classList.remove("show");}
-async function togglePaperTopic(topicId,paperId,add){
-  const r=await fetch("/api/topics/"+topicId+"/papers/"+encodeURIComponent(paperId),{method:add?"POST":"DELETE"});const d=await r.json();
-  if(!r.ok){alert(d.error||"Update failed");return;}await loadTopics();if(S.mode==="topic")await openTopic(S.activeTopic);
-}
-async function removeFromTopic(paperId){
-  await togglePaperTopic(S.activeTopic,paperId,false);
-}
-async function startTopicReview(){
-  if(!S.activeTopic)return;if(!S.llm)await loadLLMConfig();const active=S.llm.active_provider;
-  const r=await fetch("/api/topics/"+S.activeTopic+"/review",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({provider:active,model:S.llm.providers[active].model})});
-  const d=await r.json();if(!r.ok){let message=d.error||"Could not start review";if(d.missing_reports&&d.missing_reports.length)message+="\n\nMissing reports:\n"+d.missing_reports.map(x=>"• "+x.title).join("\n");alert(message);return;}await pollTopicReview();
-  clearInterval(S.reviewTimer);S.reviewTimer=setInterval(pollTopicReview,1500);
-}
-function topicReviewAction(){
-  if(S.topicReviewAvailable){$("topicReview").scrollIntoView({behavior:"smooth",block:"start"});return;}
-  startTopicReview();
-}
-async function pollTopicReview(){
-  if(!S.activeTopic)return;const id=S.activeTopic;const r=await fetch("/api/topics/"+id+"/review");const d=await r.json();if(!r.ok||id!==S.activeTopic)return;
-  const running=d.status==="running";S.topicReviewAvailable=!!d.content;$("reviewButton").disabled=running;$("reviewButton").textContent=S.topicReviewAvailable?"Open review":"Generate review";
-  $("reviewStatus").textContent=running?(d.stage+" · "+d.completed_papers+" / "+d.total_papers):(d.status==="error"?("Generation failed: "+d.error):(d.status==="stale"?"Review is out of date because membership changed.":""));
-  if(d.content){$("topicReview").innerHTML=renderMarkdown(d.content)+(S.admin?'<div class="modal-actions"><button class="edit-btn" onclick="editReview('+id+','+(d.version||1)+')">Edit Markdown</button><button class="btn-save" onclick="startTopicReview()">Regenerate review</button></div>':'');$("topicReview").style.display="block";}else{$("topicReview").style.display="none";}
-  if(!running&&S.reviewTimer){clearInterval(S.reviewTimer);S.reviewTimer=null;}await loadTopics();
-}
-function links(p){
-  let r=[];
-  if(p.source_url) r.push('<a class="link-btn" target="_blank" href="'+esc(p.source_url)+'">Link</a>');
-  if(p.arxiv_id) r.push('<a class="link-btn" target="_blank" href="https://arxiv.org/abs/'+esc(p.arxiv_id)+'">arXiv</a>');
-  return r.join(" ");
-}
-function dlButton(p){
-  if(p.has_pdf) return '<button class="dl-btn" onclick="openPDF(\''+p.id+'\')">Open PDF</button>';
-  return S.admin?'<button class="dl-btn" onclick="downloadPaper(\''+p.id+'\',this)">Download</button>':'';
-}
-function reportButton(p){
-  if(p.has_report) return '<button class="report-btn" onclick="openReport(\''+p.id+'\')">Open report</button>';
-  if(!S.admin)return '';
-  if(!p.has_pdf) return '<button class="report-btn" disabled title="PDF required">Generate report</button>';
-  return '<button class="report-btn" onclick="openReport(\''+p.id+'\')">Generate report</button>';
-}
-function openPDF(id){window.open("/pdf/"+encodeURIComponent(id),"_blank");}
-async function downloadPaper(id,btn){
-  btn.disabled=true;btn.textContent="Downloading...";
-  try{
-    const r=await fetch("/api/download",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({paper_id:id})});
-    const d=await r.json();
-    if(d.status==="ok"&&d.url){window.open(d.url,"_blank");btn.textContent="Open PDF";btn.disabled=false;}
-    else{btn.textContent="Failed";btn.disabled=false;}
-  }catch(e){btn.textContent="Error";btn.disabled=false;}
-}
-function editPaper(p){
-  $("edit-id").value=p.id;
-  $("edit-id").dataset.version=p.version||1;
-  $("edit-title").value=p.title||"";
-  $("edit-authors").value=p.authors||"";
-  $("edit-organizations").value=p.organizations||"";
-  $("edit-abstract").value=p.abstract||"";
-  $("edit-keywords").value=p.keywords||"";
-  $("edit-doi").value=p.doi||"";
-  $("edit-arxiv_id").value=p.arxiv_id||"";
-  $("edit-source_url").value=p.source_url||"";
-  $("edit-pdf_url").value=p.pdf_url||"";
-  $("edit-awards").value=p.awards||"";
-  $("editModal").classList.add("show");
-}
-function closeModal(){$("editModal").classList.remove("show");}
-async function savePaper(){
-  const id=$("edit-id").value;
-  const fields={
-    title:$("edit-title").value,authors:$("edit-authors").value,
-    organizations:$("edit-organizations").value,abstract:$("edit-abstract").value,
-    keywords:$("edit-keywords").value,doi:$("edit-doi").value,
-    arxiv_id:$("edit-arxiv_id").value,source_url:$("edit-source_url").value,
-    pdf_url:$("edit-pdf_url").value,awards:$("edit-awards").value
-  };
-  try{
-    const r=await fetch("/api/edit",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({paper_id:id,fields:fields,base_version:Number($("edit-id").dataset.version||1)})});
-    const d=await r.json();
-    if(d.updated){closeModal();load();}
-    else{alert("Save failed");}
-  }catch(e){alert("Error: "+e);}
-}
-function kwChips(p){
-  return (p.keywords||"").split(",").filter(Boolean).map(k=>{
-    return S.admin?'<span class="chip kw-chip" title="Click to edit keywords" onclick=\'editPaper('+JSON.stringify(p)+')\'>'+esc(k)+'</span>':'<span class="chip">'+esc(k)+'</span>';
-  }).join(" ");
-}
-function renderMarkdown(md){
-  let h=esc(md);
-  h=h.replace(/!\[([^\]]*)\]\((?!https?:|\/)([^)]+)\)/g, function(match, alt, src) {
-    return '<img alt="'+alt+'" src="/reports/'+src+'" style="max-width:100%;border:1px solid #dfe3e8;border-radius:8px;margin:8px 0" />';
-  });
-  h=h.replace(/^### (.+)$/gm,'<h3>$1</h3>');
-  h=h.replace(/^## (.+)$/gm,'<h2>$1</h2>');
-  h=h.replace(/^# (.+)$/gm,'<h1>$1</h1>');
-  h=h.replace(/```([\s\S]*?)```/g,'<pre><code>$1</code></pre>');
-  h=h.replace(/`([^`]+)`/g,'<code>$1</code>');
-  h=h.replace(/!\[([^\]]*)\]\((?!https?:|\/)([^)]+)\)/g, function(match, alt, src) {
-    return '<img alt="'+alt+'" src="/reports/'+src+'" style="max-width:100%;border:1px solid #dfe3e8;border-radius:8px;margin:8px 0" />';
-  });
-  h=h.replace(/^\- (.+)$/gm,'<li>$1</li>');
-  h=h.replace(/^\d+\. (.+)$/gm,'<li>$1</li>');
-  h=h.replace(/(<li>[\s\S]*?<\/li>)/g,'<ul>$1</ul>');
-  h=h.replace(/<\/ul>\s*<ul>/g,'');
-  h=h.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>');
-  h=h.replace(/([^<>\n])\n\n/g,'$1</p><p>');
-  h='<p>'+h+'</p>';
-  return h.replace(/<p>\s*<(h[123]|ul|pre)/g,'<$1').replace(/<\/(h[123]|ul|pre)>\s*<\/p>/g,'</$1>');
-}
-async function openReport(id){
-  $("reportLoading").style.display="block";
-  $("reportContent").style.display="none";
-  $("reportModal").classList.add("show");
-  try{
-    const r=await fetch("/api/report?id="+encodeURIComponent(id));
-    const d=await r.json();
-    if(r.ok&&d.status==="ok"&&d.content){
-      const html=renderMarkdown(d.content);
-      $("reportContent").innerHTML=html+(S.admin?'<div class="modal-actions" style="margin-top:16px;border-top:1px solid #dfe3e8;padding-top:12px;display:flex;justify-content:flex-end;gap:8px"><button class="edit-btn" onclick="editReport('+JSON.stringify(id)+','+(d.version||1)+')">Edit Markdown</button><button class="btn-save" onclick="generateReport('+JSON.stringify(id)+')">&#x21bb; Regenerate</button></div>':'');
-      $("reportLoading").style.display="none";
-      $("reportContent").style.display="block";
-    }else if(r.ok&&d.status==="none"){
-      if(S.admin)await generateReport(id);else $("reportLoading").textContent="No report is available.";
-    }else{
-      $("reportLoading").textContent=d.error||"Report could not be loaded.";
-    }
-  }catch(e){
-    $("reportLoading").textContent="Error: "+e;
-  }
-}
-
-async function load(reset){
-  if(S.mode==="topic")return openTopic(S.activeTopic);
-  if(reset)S.page=1;
-  const p=new URLSearchParams({page:S.page,per_page:"50",q:$("q").value,venue:$("venue").value,year:$("year").value,org:$("org").value});
-  const d=await fetch("/api/papers?"+p).then(r=>r.json());
-  if(S.mode!=="library")return;
-  S.pages=d.pages||1;
-  S.visiblePapers=d.papers;$("papers").innerHTML=d.papers.length?d.papers.map(card).join(""):'<div class="empty">No matching papers</div>';
-  $("page").textContent=d.page+" / "+S.pages+" ("+d.total.toLocaleString()+" papers)";
-  $("prev").disabled=S.page<=1;$("next").disabled=S.page>=S.pages;
-  window.scrollTo({top:0});
-}
-async function semanticSearch(){
-  const q=$("q").value.trim();
-  if(!q){load(true);return;}
-  const p=new URLSearchParams({q:q,venue:$("venue").value,year:$("year").value,org:$("org").value});
-  const d=await fetch("/api/search?"+p).then(r=>r.json());
-  if(S.mode!=="library")return;
-  S.pages=1;
-  const matches=d.matches||[];
-  S.visiblePapers=matches;$("papers").innerHTML=matches.length?matches.map(card).join(""):'<div class="empty">No matching papers</div>';
-  $("page").textContent=matches.length+" results (semantic)";
-  $("prev").disabled=true;$("next").disabled=true;
-}
-let timer;
-function onInput(){
-  clearTimeout(timer);
-  timer=setTimeout(()=>load(true),300);
-}
-async function generateReport(id){
-  $("reportLoading").style.display="block";
-  $("reportLoading").textContent="Generating report, please wait...";
-  $("reportContent").style.display="none";
-  try{
-    if(!S.llm)await loadLLMConfig();
-    const active=S.llm.active_provider;
-    const r=await fetch("/api/report",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({paper_id:id,provider:active,model:S.llm.providers[active].model})});
-    const d=await r.json();
-    if(r.ok&&d.status==="ok"){
-      const r2=await fetch("/api/report?id="+encodeURIComponent(id));
-      const d2=await r2.json();
-      if(d2.status==="ok"&&d2.content){
-        openReport(id);
-      }else{
-        $("reportLoading").textContent="Report generated but could not be loaded.";
-      }
-    }else{
-      $("reportLoading").textContent=d.error||"Generation failed";
-    }
-  }catch(e){
-    $("reportLoading").textContent="Error: "+e;
-  }
-}
-function closeReport(){$("reportModal").classList.remove("show");}
-function card(p){
-  const m=(p.venue_memberships||(p.venue||"")+" "+(p.year||"")).split("|").filter(Boolean).map(x=>'<span class="chip">'+esc(x)+'</span>').join("");
-  let html='<article class="paper"><div class="title">'+esc(p.title)+'</div>';
-  html+='<div class="meta">'+m+" "+kwChips(p)+'</div>';
-  html+='<div class="authors">'+esc(p.authors||"")+'</div>';
-  if(p.organizations) html+='<div class="orgs">'+esc(p.organizations)+'</div>';
-  if(p.abstract) html+='<details><summary>Abstract</summary><div class="abstract">'+esc(p.abstract)+'</div></details>';
-  const topicAction=!S.admin?'':(S.mode==="topic"?'<button class="remove-topic-btn" onclick=\'removeFromTopic('+JSON.stringify(p.id)+')\'>Remove from topic</button>':'<button class="add-topic-btn" onclick=\'openTopicPickerById('+JSON.stringify(p.id)+')\'>Add to topic</button>');
-  html+='<div class="links">'+links(p)+" "+dlButton(p)+" "+reportButton(p)+topicAction+(S.admin?'<button class="edit-btn" onclick="editPaper('+esc(JSON.stringify(p))+')">Edit</button>':'')+'</div></article>';
-  return html;
-}
-
-$("q").addEventListener("input",onInput);
-$("q").addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();semanticSearch();}});
-["venue","year","org"].forEach(id=>$(id).addEventListener("change",()=>load(true)));
-$("prev").onclick=()=>{S.page--;load();};
-$("next").onclick=()=>{S.page++;load();};
-$("reportModal").addEventListener("click",e=>{if(e.target===$("reportModal"))closeReport();});
-$("llmModal").addEventListener("click",e=>{if(e.target===$("llmModal"))closeLLMSettings();});
-$("llmSettings").onclick=openLLMSettings;$("authButton").onclick=authAction;$("syncButton").onclick=openSync;
-$("llm-provider").addEventListener("change",showLLMProvider);
-$("new-topic-name").addEventListener("keydown",e=>{if(e.key==="Enter")submitCreateTopic();});
-async function editReport(id,version){const d=await fetch("/api/report?id="+encodeURIComponent(id)).then(r=>r.json());openMarkdownEditor("report",id,version,d.content||"");}
-async function editReview(id,version){const d=await fetch("/api/topics/"+id+"/review").then(r=>r.json());openMarkdownEditor("review",id,version,d.content||"");}
-async function openMarkdownEditor(type,id,version,content){S.markdown={type,id,version};$("markdownTitle").textContent="Edit "+type;$("markdownContent").value=content;$("markdownPreview").style.display="none";$("markdownModal").classList.add("show");const d=await fetch("/api/history/"+type+"/"+encodeURIComponent(id)).then(r=>r.json());$("historyList").innerHTML=(d.versions||[]).map((v,i)=>'<button onclick="restoreHistory('+i+')">Version '+v.version+' · '+new Date(v.created_at*1000).toLocaleString()+'</button>').join(" ");S.markdown.history=d.versions||[];}
-function restoreHistory(index){if(S.markdown&&S.markdown.history[index])$("markdownContent").value=S.markdown.history[index].content;}
-function closeMarkdownEditor(){$("markdownModal").classList.remove("show");S.markdown=null;}
-function previewMarkdown(){$("markdownPreview").innerHTML=renderMarkdown($("markdownContent").value);$("markdownPreview").style.display="block";}
-async function saveMarkdown(){if(!S.markdown)return;const m=S.markdown;const url=m.type==="report"?"/api/reports/"+encodeURIComponent(m.id):"/api/topics/"+m.id+"/review";const r=await fetch(url,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({content:$("markdownContent").value,base_version:m.version})});const d=await r.json();if(!r.ok){alert(d.error||"Save failed");return;}closeMarkdownEditor();if(m.type==="report")openReport(m.id);else pollTopicReview();}
-async function renameTopic(){const t=S.topics.find(x=>x.id===S.activeTopic);if(!t)return;const name=prompt("Topic name",t.name);if(!name||name===t.name)return;const r=await fetch("/api/topics/"+t.id,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,base_version:t.version||1})});const d=await r.json();if(!r.ok){alert(d.error||"Rename failed");return;}await loadTopics();await openTopic(t.id);}
-loadSession().then(()=>Promise.all([facets(),loadLLMConfig(),loadTopics()])).then(()=>load());
-</script>
-</body>
-</html>
-"""

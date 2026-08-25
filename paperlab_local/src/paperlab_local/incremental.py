@@ -53,6 +53,9 @@ def apply_change(store: Store, change: dict, cfg, *, remote=True) -> list[str]:
     now = time.time()
     conflicts: list[str] = []
 
+    if entity_type == "report":
+        return ["legacy_report_rejected"]
+
     if entity_type == "paper":
         row = store.get(entity_id)
         if row is None:
@@ -155,13 +158,69 @@ def apply_change(store: Store, change: dict, cfg, *, remote=True) -> list[str]:
             store.upsert_venue(fields["paper_id"], venue=fields["venue"], year=int(fields["year"]),
                                track=fields.get("track"), source=fields.get("source") or "sync")
 
-    elif entity_type in {"report", "review"} and "content" in fields:
-        if entity_type == "report":
-            from .report import report_path_for
-            path = report_path_for(cfg, entity_id)
-            row = store.get_report(entity_id)
-            current = int(row["version"] or 1) if row else 0
-        else:
+    elif entity_type == "paper_summary":
+        if not store.get(entity_id):
+            return conflicts
+        row = store.get_summary(entity_id)
+        current = int(row["version"] or 1) if row else 0
+        if incoming_version >= current:
+            store.conn.execute(
+                """INSERT INTO paper_summaries
+                   (paper_id,content,abstract_hash,status,provider,model,generated_at,updated_at,version,updated_by_device)
+                   VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(paper_id) DO UPDATE SET
+                   content=excluded.content,abstract_hash=excluded.abstract_hash,status=excluded.status,
+                   provider=excluded.provider,model=excluded.model,generated_at=excluded.generated_at,
+                   updated_at=excluded.updated_at,version=excluded.version,
+                   updated_by_device=excluded.updated_by_device,deleted_at=NULL""",
+                (entity_id, fields.get("content", ""), fields.get("abstract_hash", ""),
+                 fields.get("status", "ok"), fields.get("provider"), fields.get("model"),
+                 fields.get("generated_at"), now, incoming_version, device),
+            )
+
+    elif entity_type == "note" and "content" in fields:
+        if not store.get(entity_id):
+            return conflicts
+        from .reader import _note_path
+        content = str(fields.get("content") or "")
+        if len(content.encode("utf-8")) > 5 * 1024 * 1024:
+            return ["note_too_large"]
+        path = _note_path(cfg.pdf_root, entity_id)
+        row = store.get_note(entity_id)
+        current = int(row["version"] or 1) if row else 0
+        local_content = path.read_text(encoding="utf-8") if path.is_file() else ""
+        if row and current != base and local_content != content:
+            import re as _re
+            safe_device = _re.sub(r"[^A-Za-z0-9_.-]", "_", device)[:48] or "remote"
+            conflict_content = content if current > incoming_version else local_content
+            conflict_path = path.with_name(
+                f"{path.stem}.conflict-{safe_device}-{time.strftime('%Y%m%d-%H%M%S')}.md")
+            conflict_path.parent.mkdir(parents=True, exist_ok=True)
+            conflict_path.write_text(conflict_content, encoding="utf-8")
+            conflicts.append("content")
+        if incoming_version >= current:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp = path.with_suffix(".md.sync-tmp")
+            temp.write_text(content, encoding="utf-8")
+            os.replace(temp, path)
+            digest = fields.get("content_hash") or __import__("hashlib").sha256(content.encode()).hexdigest()
+            store.conn.execute(
+                """INSERT INTO paper_notes
+                   (paper_id,note_path,content_hash,updated_at,version,updated_by_device,sync_error)
+                   VALUES (?,?,?,?,?,?,NULL) ON CONFLICT(paper_id) DO UPDATE SET
+                   note_path=excluded.note_path,content_hash=excluded.content_hash,
+                   updated_at=excluded.updated_at,version=excluded.version,
+                   updated_by_device=excluded.updated_by_device,sync_error=NULL,deleted_at=NULL""",
+                (entity_id, str(path), digest, fields.get("updated_at") or now, incoming_version, device),
+            )
+            store.conn.execute(
+                """INSERT OR IGNORE INTO content_versions
+                   (entity_type,entity_id,version,content,content_hash,created_at,device_id)
+                   VALUES ('note',?,?,?,?,?,?)""",
+                (entity_id, incoming_version, content, digest, now, device),
+            )
+
+    elif entity_type == "review" and "content" in fields:
+        if entity_type == "review":
             from .report import topic_review_path_for
             topic = _topic(store, entity_id)
             if not topic:
@@ -191,27 +250,23 @@ def apply_change(store: Store, change: dict, cfg, *, remote=True) -> list[str]:
             temp = path.with_suffix(path.suffix + ".sync-tmp")
             temp.write_text(fields["content"], encoding="utf-8")
             os.replace(temp, path)
-            if entity_type == "report":
-                store.conn.execute(
-                    """INSERT INTO paper_reports(paper_id,report_path,status,generated_at,updated_at,version,updated_by_device)
-                       VALUES (?,?,'ok',?,?,?,?) ON CONFLICT(paper_id) DO UPDATE SET report_path=excluded.report_path,
-                       status='ok',updated_at=excluded.updated_at,version=excluded.version,updated_by_device=excluded.updated_by_device""",
-                    (entity_id, str(path), now, now, incoming_version, device),
-                )
-            else:
-                store.conn.execute(
-                    """INSERT INTO topic_reviews(topic_id,review_path,status,stage,updated_at,version,updated_by_device)
-                       VALUES (?,?,'ok','synced',?,?,?) ON CONFLICT(topic_id) DO UPDATE SET review_path=excluded.review_path,
-                       status='ok',stage='synced',updated_at=excluded.updated_at,version=excluded.version,
-                       updated_by_device=excluded.updated_by_device""",
-                    (topic["id"], str(path), now, incoming_version, device),
-                )
+            store.conn.execute(
+                """INSERT INTO topic_reviews(topic_id,review_path,status,stage,updated_at,version,updated_by_device)
+                   VALUES (?,?,'ok','synced',?,?,?) ON CONFLICT(topic_id) DO UPDATE SET review_path=excluded.review_path,
+                   status='ok',stage='synced',updated_at=excluded.updated_at,version=excluded.version,
+                   updated_by_device=excluded.updated_by_device""",
+                (topic["id"], str(path), now, incoming_version, device),
+            )
     return conflicts
 
 
 def push_to_server(store: Store, changes: list[dict], cfg) -> dict:
     accepted = []
+    rejected = []
     for incoming in changes:
+        if incoming.get("entity_type") == "report":
+            rejected.append({"change_id": incoming.get("change_id"), "error": "legacy_report_rejected"})
+            continue
         existing = store.conn.execute(
             "SELECT server_sequence FROM sync_changes WHERE change_id=?", (incoming["change_id"],)
         ).fetchone()
@@ -229,7 +284,7 @@ def push_to_server(store: Store, changes: list[dict], cfg) -> dict:
         accepted.append({"change_id": incoming["change_id"], "server_sequence": sequence,
                          "conflicts": conflicts})
     store.conn.commit()
-    return {"accepted": accepted}
+    return {"accepted": accepted, "rejected": rejected}
 
 
 def sync_now(cfg, *, log=print) -> dict:
@@ -342,7 +397,10 @@ def sync_now(cfg, *, log=print) -> dict:
             response = requests.post(base_url + "/api/sync/push", headers=headers,
                                      json={"changes": batch}, timeout=120)
             response.raise_for_status()
-            for item in response.json().get("accepted", []):
+            payload = response.json()
+            if payload.get("rejected"):
+                raise RuntimeError("sync server rejected changes: " + json.dumps(payload["rejected"], ensure_ascii=False))
+            for item in payload.get("accepted", []):
                 store.conn.execute("UPDATE sync_changes SET uploaded_at=?,server_sequence=? WHERE change_id=?",
                                    (time.time(), item["server_sequence"], item["change_id"]))
                 pushed += 1

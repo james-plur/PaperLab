@@ -52,8 +52,8 @@ def _paper_select(alias="p"):
         f"{alias}.citation_count,{alias}.keywords,"
         f"(SELECT group_concat(pv.venue || ' ' || pv.year,'|') FROM paper_venues pv WHERE pv.paper_id={alias}.id) venue_memberships,"
         f"(SELECT group_concat(ctp.topic_id,',') FROM collection_topic_papers ctp WHERE ctp.paper_id={alias}.id) collection_topic_ids,"
-        f"(SELECT pr.report_path FROM paper_reports pr WHERE pr.paper_id={alias}.id AND pr.status='ok') report_path,"
-        f"(SELECT pr.status FROM paper_reports pr WHERE pr.paper_id={alias}.id) report_status"
+        f"(SELECT ps.content FROM paper_summaries ps WHERE ps.paper_id={alias}.id AND ps.status='ok' AND ps.deleted_at IS NULL) summary_zh,"
+        f"EXISTS(SELECT 1 FROM paper_notes pn WHERE pn.paper_id={alias}.id AND pn.deleted_at IS NULL) has_note"
     )
 
 def _paper_dict(row):
@@ -61,9 +61,7 @@ def _paper_dict(row):
     pdf_path = value.pop("pdf_path", None)
     value["has_pdf"] = bool(pdf_path and os.path.isfile(pdf_path))
     value["pdf_path"] = None  # compatibility without exposing host paths
-    report_path = value.pop("report_path", None)
-    value["has_report"] = bool(
-        value.pop("report_status", None) == "ok" and report_path and os.path.isfile(report_path))
+    value["has_note"] = bool(value.get("has_note"))
     return value
 def query_papers(db_path, params):
     def one(name, default=""):
@@ -378,6 +376,13 @@ class PaperHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         try:
+            public_or_device = (parsed.path in {"/", "/index.html", "/login", "/robots.txt", "/api/health",
+                                                "/api/auth/session", "/api/sync/handshake"}
+                                or parsed.path.startswith("/api/sync/objects/")
+                                or parsed.path == "/api/sync/pull")
+            if not public_or_device and not self._is_admin():
+                self._send_json({"error": "login required"}, 401)
+                return
             object_match = re.fullmatch(r"/api/sync/objects/([0-9a-f]{64})", parsed.path)
             if object_match:
                 if not self._require_device():
@@ -390,6 +395,9 @@ class PaperHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": "object not found"}, 404)
                     return
                 self._send(Path(row["storage_path"]).read_bytes(), row["content_type"])
+            elif parsed.path == "/api/health":
+                from .protocol import handshake
+                self._send_json({"status":"ok", **handshake()})
             elif parsed.path == "/robots.txt":
                 self._send(b"User-agent: *\nDisallow: /\n", "text/plain; charset=utf-8")
             elif parsed.path == "/api/auth/session":
@@ -472,6 +480,29 @@ class PaperHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/papers":
                 self._send(json.dumps(query_papers(self.db_path, parse_qs(parsed.query)), ensure_ascii=False).encode(),
                            "application/json; charset=utf-8")
+            elif re.fullmatch(r"/api/papers/[^/]+/summary", parsed.path):
+                import urllib.parse as ul
+                paper_id = ul.unquote(parsed.path[len("/api/papers/"):-len("/summary")])
+                conn = _connect(self.db_path)
+                try:
+                    row = conn.execute("SELECT * FROM paper_summaries WHERE paper_id=? AND deleted_at IS NULL", (paper_id,)).fetchone()
+                finally: conn.close()
+                self._send_json(dict(row) if row else {"paper_id":paper_id,"status":"none","version":0})
+            elif re.fullmatch(r"/api/papers/[^/]+/note", parsed.path):
+                import urllib.parse as ul
+                paper_id = ul.unquote(parsed.path[len("/api/papers/"):-len("/note")])
+                conn = _connect(self.db_path)
+                try: row = conn.execute("SELECT * FROM paper_notes WHERE paper_id=? AND deleted_at IS NULL",(paper_id,)).fetchone()
+                finally: conn.close()
+                content = Path(row["note_path"]).read_text(encoding="utf-8") if row and Path(row["note_path"]).is_file() else ""
+                self._send_json({"paper_id":paper_id,"content":content,"version":int(row["version"]) if row else 0,
+                                 "updated_at":row["updated_at"] if row else None})
+            elif re.fullmatch(r"/api/papers/[^/]+", parsed.path):
+                import urllib.parse as ul
+                conn = _connect(self.db_path)
+                try: row = conn.execute("SELECT * FROM papers WHERE id=? AND deleted_at IS NULL",(ul.unquote(parsed.path[len('/api/papers/'):]),)).fetchone()
+                finally: conn.close()
+                self._send_json(dict(row) if row else {"error":"paper not found"},200 if row else 404)
             elif parsed.path == "/api/facets":
                 self._send(json.dumps(query_facets(self.db_path), ensure_ascii=False).encode(),
                           "application/json; charset=utf-8")
@@ -497,9 +528,7 @@ class PaperHandler(BaseHTTPRequestHandler):
             elif self._topic_route(parsed.path):
                 self._serve_topic(self._topic_route(parsed.path))
             elif parsed.path == "/api/report":
-                import urllib.parse as ul
-                pid = ul.unquote(parse_qs(parsed.query).get("id", [""])[0])
-                self._serve_report(pid)
+                self._send_json({"error":"deprecated","replacement":"paper note and summary"},410)
             elif parsed.path in ("/", "/index.html", "/login"):
                 self._send(HTML.encode(), "text/html; charset=utf-8")
             else:
@@ -818,30 +847,7 @@ class PaperHandler(BaseHTTPRequestHandler):
         self._send_json({"status": "ok", "version": new_version})
 
     def do_PATCH(self):
-        parsed = urlparse(self.path)
-        try:
-            if not self._require_admin():
-                return
-            data = self._read_json()
-            topic_id = self._topic_route(parsed.path)
-            if topic_id:
-                from .store import Store
-                with Store(str(self.db_path), backup_on_migrate=False) as store:
-                    try:
-                        topic = store.update_topic_name(topic_id, data.get("name", ""),
-                                                        base_version=data.get("base_version"))
-                    except KeyError:
-                        self._send_json({"error": "topic not found"}, 404)
-                        return
-                    except RuntimeError:
-                        self._send_json({"error": "version conflict"}, 409)
-                        return
-                self._send_json(dict(topic))
-                return
-            self._send_json({"error": "not found"}, 404)
-        except Exception as exc:
-            print("[web] PATCH error:", repr(exc), flush=True)
-            self._send_json({"error": "internal server error"}, 500)
+        self._send_json({"error": "read_only_server"}, 403)
 
     def do_PUT(self):
         parsed = urlparse(self.path)
@@ -893,19 +899,7 @@ class PaperHandler(BaseHTTPRequestHandler):
                         store.conn.commit()
                 self._send_json({"received": received, "complete": complete})
                 return
-            if not self._require_admin():
-                return
-            data = self._read_json()
-            match = re.fullmatch(r"/api/reports/(.+)", parsed.path)
-            if match:
-                import urllib.parse as ul
-                self._save_markdown("report", ul.unquote(match.group(1)), data.get("content"), data.get("base_version"))
-                return
-            topic_id = self._topic_route(parsed.path, "review")
-            if topic_id:
-                self._save_markdown("review", str(topic_id), data.get("content"), data.get("base_version"))
-                return
-            self._send_json({"error": "not found"}, 404)
+            self._send_json({"error": "read_only_server"}, 403)
         except Exception as exc:
             print("[web] PUT error:", repr(exc), flush=True)
             self._send_json({"error": "internal server error"}, 500)
@@ -913,6 +907,9 @@ class PaperHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         try:
+            if parsed.path not in {"/api/auth/login", "/api/auth/logout", "/api/sync/push"}:
+                self._send_json({"error": "read_only_server"}, 403)
+                return
             if parsed.path == "/api/papers/import/preview":
                 if not self._require_admin():
                     return
@@ -1095,52 +1092,7 @@ class PaperHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "internal server error"}, 500)
 
     def do_DELETE(self):
-        parsed = urlparse(self.path)
-        try:
-            if not self._require_admin():
-                return
-            device_match = re.fullmatch(r"/api/sync/devices/([^/]+)", parsed.path)
-            if device_match:
-                import urllib.parse as ul
-                from .store import Store
-                with Store(str(self.db_path), backup_on_migrate=False) as store:
-                    result = store.conn.execute(
-                        "UPDATE sync_devices SET revoked_at=? WHERE device_id=? AND revoked_at IS NULL",
-                        (time.time(), ul.unquote(device_match.group(1))),
-                    )
-                    store.conn.commit()
-                self._send_json({"revoked": bool(result.rowcount)})
-                return
-            paper_route = self._topic_paper_route(parsed.path)
-            if paper_route:
-                topic_id, paper_id = paper_route
-                from .store import Store
-                try:
-                    with Store(str(self.db_path), backup_on_migrate=False) as store:
-                        removed = store.remove_paper_from_collection(topic_id, paper_id)
-                    self._send_json({"status": "ok", "removed": removed})
-                except KeyError:
-                    self._send_json({"error": "topic not found"}, 404)
-            elif self._topic_route(parsed.path):
-                topic_id = self._topic_route(parsed.path)
-                from .store import Store
-                with Store(str(self.db_path), backup_on_migrate=False) as store:
-                    deleted = store.delete_collection_topic(topic_id)
-                if deleted is None:
-                    self._send_json({"error": "topic not found"}, 404)
-                    return
-                review = deleted["review"]
-                review_path = review["review_path"] if review else None
-                if review_path:
-                    path = Path(review_path)
-                    if path.is_file():
-                        path.unlink()
-                self._send_json({"status": "ok"})
-            else:
-                self._send_json({"error": "not found"}, 404)
-        except Exception as exc:
-            print("[web] DELETE error:", repr(exc), flush=True)
-            self._send_json({"error": "internal server error"}, 500)
+        self._send_json({"error": "read_only_server"}, 403)
 
     def log_message(self, fmt, *args):
         print("[web] " + fmt % args, flush=True)
@@ -1229,7 +1181,8 @@ a{color:var(--accent);text-decoration:none}.pager{display:flex;justify-content:c
 .report-modal p,.report-modal li{font-size:14px;margin:6px 0}.report-modal code{background:#f0f0f0;padding:1px 4px;border-radius:3px;font-size:13px}.report-modal pre{background:#f6f8fa;padding:12px;border-radius:8px;overflow-x:auto}
 .report-modal .modal-actions{margin-top:20px}
 .topic-header{display:flex;align-items:center;gap:12px;background:#fff;border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:12px}.topic-header h2{margin:0;flex:1}.review-status{color:var(--muted);margin:8px 0}.topic-review{background:#fff;border:1px solid var(--line);border-radius:10px;padding:20px;margin:12px 0}.add-topic-btn{background:#8a5b18;color:#fff;border:0;padding:4px 10px;margin-left:6px}.remove-topic-btn{background:#9b3b3b;color:#fff;border:0;padding:4px 10px;margin-left:6px}
-.readonly .admin-only{display:none!important}.markdown-editor{width:100%;min-height:360px;font-family:ui-monospace,SFMono-Regular,monospace}.auth-status{margin-left:auto}
+.readonly .admin-only,.readonly .edit-btn,.readonly .dl-btn,.readonly .report-btn{display:none!important}.markdown-editor{width:100%;min-height:360px;font-family:ui-monospace,SFMono-Regular,monospace}.auth-status{margin-left:auto}
+.login-gate{background:linear-gradient(145deg,#f4f8f7,#e5efed)}.login-gate header,.login-gate .layout{filter:blur(2px);pointer-events:none;user-select:none}.login-gate #loginModal{display:flex;justify-content:center;align-items:center;background:rgba(20,38,35,.62)}.login-gate #loginModal .modal{max-width:420px;box-shadow:0 24px 70px rgba(0,0,0,.24)}.login-gate #loginCancel{display:none}.login-help{color:var(--muted);font-size:13px;line-height:1.5;margin:-6px 0 14px}
 @media(max-width:800px){.layout{grid-template-columns:1fr}.sidebar{position:static;height:auto;border-right:0;border-bottom:1px solid var(--line)}header{position:static}}
 </style></head><body>
 <header><div class="bar"><h1>PaperLab</h1>
@@ -1293,7 +1246,7 @@ a{color:var(--accent);text-decoration:none}.pager{display:flex;justify-content:c
 </div>
 <div class="modal-overlay" id="topicModal"><div class="modal"><h2>Add to topic</h2><input type="hidden" id="topic-paper-id"><div id="topicChoices"></div><div class="modal-actions"><button class="btn-cancel" onclick="closeTopicPicker()">Close</button></div></div></div>
 <div class="modal-overlay" id="createTopicModal"><div class="modal"><h2>New topic</h2><label for="new-topic-name">Name</label><input id="new-topic-name" type="text" maxlength="120"><div class="modal-actions"><button class="btn-cancel" onclick="closeCreateTopic()">Cancel</button><button class="btn-save" onclick="submitCreateTopic()">Create</button></div></div></div>
-<div class="modal-overlay" id="loginModal"><div class="modal"><h2>Administrator login</h2><label for="admin-username">Username</label><input id="admin-username" value="admin" autocomplete="username"><label for="admin-password">Password</label><input id="admin-password" type="password" autocomplete="current-password"><div id="loginError" class="review-status"></div><div class="modal-actions"><button class="btn-cancel" onclick="closeLogin()">Cancel</button><button class="btn-save" onclick="login()">Login</button></div></div></div>
+<div class="modal-overlay" id="loginModal"><div class="modal"><h2>Sign in to PaperLab</h2><p class="login-help">This server is read-only after sign-in. Paper editing and synchronization are available from the PaperLab desktop app.</p><label for="admin-username">Username</label><input id="admin-username" value="admin" autocomplete="username"><label for="admin-password">Password</label><input id="admin-password" type="password" autocomplete="current-password"><div id="loginError" class="review-status"></div><div class="modal-actions"><button id="loginCancel" class="btn-cancel" onclick="closeLogin()">Cancel</button><button class="btn-save" onclick="login()">Login</button></div></div></div>
 <div class="modal-overlay" id="addPaperModal"><div class="modal report-modal"><h2>Add Paper</h2>
 <label for="importPdf">Upload PDF (optional, maximum 50 MB)</label><input id="importPdf" type="file" accept="application/pdf,.pdf"><button class="btn-save" id="parsePdfButton" onclick="parseImportPdf()">Parse PDF</button>
 <div id="importStatus" class="review-status"></div><div id="importDuplicate" class="paper" style="display:none"></div>
@@ -1318,10 +1271,11 @@ const S={page:1,pages:1,mode:"library",llm:null,topics:[],activeTopic:null,revie
 const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const nativeFetch=window.fetch.bind(window);window.fetch=(url,opts={})=>{opts={...opts};const method=(opts.method||"GET").toUpperCase();if(method!=="GET"&&S.csrf){opts.headers={...(opts.headers||{}),"X-CSRF-Token":S.csrf};}return nativeFetch(url,opts);};
-async function loadSession(){const d=await nativeFetch("/api/auth/session").then(r=>r.json());S.admin=!!d.authenticated;S.csrf=d.csrf_token||null;document.body.classList.toggle("readonly",!S.admin);$("authButton").textContent=S.admin?(d.trusted_local?"Local admin":"Logout"):"Admin login";}
-function closeLogin(){$("loginModal").classList.remove("show");}
-async function login(){const r=await nativeFetch("/api/auth/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:$("admin-username").value,password:$("admin-password").value})});const d=await r.json();if(!r.ok){$("loginError").textContent=d.error||"Login failed";return;}S.csrf=d.csrf_token;closeLogin();await loadSession();await loadTopics();load(true);}
-async function authAction(){if(!S.admin){$("admin-password").value="";$("loginError").textContent="";$("loginModal").classList.add("show");return;}if($("authButton").textContent==="Local admin")return;await fetch("/api/auth/logout",{method:"POST"});S.csrf=null;await loadSession();load(true);}
+async function loadSession(){const r=await nativeFetch("/api/auth/session");const d=await r.json();S.admin=!!d.authenticated;S.csrf=d.csrf_token||null;document.body.classList.add("readonly");document.body.classList.toggle("login-gate",!S.admin);$("loginModal").classList.toggle("show",!S.admin);$("authButton").textContent=S.admin?"Logout":"Login";return S.admin;}
+function closeLogin(){if(S.admin)$("loginModal").classList.remove("show");}
+async function loadAuthenticated(){await Promise.all([facets(),loadLLMConfig(),loadTopics()]);await load(true);}
+async function login(){const button=$("loginModal").querySelector(".btn-save");button.disabled=true;$("loginError").textContent="Signing in…";try{const r=await nativeFetch("/api/auth/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:$("admin-username").value,password:$("admin-password").value})});const d=await r.json();if(!r.ok){$("loginError").textContent=d.error||"Login failed";return;}S.csrf=d.csrf_token;if(await loadSession()){$("loginError").textContent="";await loadAuthenticated();}}catch(e){$("loginError").textContent="Could not connect to PaperLab. Please try again.";}finally{button.disabled=false;}}
+async function authAction(){if(!S.admin){$("admin-password").value="";$("loginError").textContent="";document.body.classList.add("login-gate");$("loginModal").classList.add("show");return;}if($("authButton").textContent==="Local admin")return;await fetch("/api/auth/logout",{method:"POST"});S.csrf=null;await loadSession();$("papers").innerHTML="";$("topicList").innerHTML="";}
 const importFields=["title","authors","organizations","abstract","keywords","doi","arxiv_id","venue","year","source_url","pdf_url"];
 function importValues(){const values={};importFields.forEach(f=>values[f]=$("import-"+f).value.trim());if(values.year)values.year=Number(values.year);return values;}
 function fillImport(values){importFields.forEach(f=>{$("import-"+f).value=(values&&values[f])||"";});}
@@ -1453,14 +1407,11 @@ function links(p){
   return r.join(" ");
 }
 function dlButton(p){
-  if(p.has_pdf) return '<button class="dl-btn" onclick="openPDF(\''+p.id+'\')">Open PDF</button>';
+  if(p.has_pdf) return '<button class="link-btn" onclick="openPDF(\''+p.id+'\')">Open PDF</button>';
   return S.admin?'<button class="dl-btn" onclick="downloadPaper(\''+p.id+'\',this)">Download</button>':'';
 }
 function reportButton(p){
-  if(p.has_report) return '<button class="report-btn" onclick="openReport(\''+p.id+'\')">Open report</button>';
-  if(!S.admin)return '';
-  if(!p.has_pdf) return '<button class="report-btn" disabled title="PDF required">Generate report</button>';
-  return '<button class="report-btn" onclick="openReport(\''+p.id+'\')">Generate report</button>';
+  return '<button class="link-btn" onclick="openReport(\''+p.id+'\')">View note</button>';
 }
 function openPDF(id){window.open("/pdf/"+encodeURIComponent(id),"_blank");}
 async function downloadPaper(id,btn){
@@ -1536,17 +1487,17 @@ async function openReport(id){
   $("reportContent").style.display="none";
   $("reportModal").classList.add("show");
   try{
-    const r=await fetch("/api/report?id="+encodeURIComponent(id));
+    const r=await fetch("/api/papers/"+encodeURIComponent(id)+"/note");
     const d=await r.json();
-    if(r.ok&&d.status==="ok"&&d.content){
+    if(r.ok&&d.content){
       const html=renderMarkdown(d.content);
-      $("reportContent").innerHTML=html+(S.admin?'<div class="modal-actions" style="margin-top:16px;border-top:1px solid #dfe3e8;padding-top:12px;display:flex;justify-content:flex-end;gap:8px"><button class="edit-btn" onclick="editReport('+JSON.stringify(id)+','+(d.version||1)+')">Edit Markdown</button><button class="btn-save" onclick="generateReport('+JSON.stringify(id)+')">&#x21bb; Regenerate</button></div>':'');
+      $("reportContent").innerHTML=html;
       $("reportLoading").style.display="none";
       $("reportContent").style.display="block";
-    }else if(r.ok&&d.status==="none"){
-      if(S.admin)await generateReport(id);else $("reportLoading").textContent="No report is available.";
+    }else if(r.ok){
+      $("reportLoading").textContent="No note is available.";
     }else{
-      $("reportLoading").textContent=d.error||"Report could not be loaded.";
+      $("reportLoading").textContent=d.error||"Note could not be loaded.";
     }
   }catch(e){
     $("reportLoading").textContent="Error: "+e;
@@ -1614,6 +1565,7 @@ function card(p){
   html+='<div class="authors">'+esc(p.authors||"")+'</div>';
   if(p.organizations) html+='<div class="orgs">'+esc(p.organizations)+'</div>';
   if(p.abstract) html+='<details><summary>Abstract</summary><div class="abstract">'+esc(p.abstract)+'</div></details>';
+  if(p.summary_zh) html+='<details><summary>中文概要</summary><div class="abstract">'+esc(p.summary_zh)+'</div></details>';
   const topicAction=!S.admin?'':(S.mode==="topic"?'<button class="remove-topic-btn" onclick=\'removeFromTopic('+JSON.stringify(p.id)+')\'>Remove from topic</button>':'<button class="add-topic-btn" onclick=\'openTopicPickerById('+JSON.stringify(p.id)+')\'>Add to topic</button>');
   html+='<div class="links">'+links(p)+" "+dlButton(p)+" "+reportButton(p)+topicAction+(S.admin?'<button class="edit-btn" onclick="editPaper('+esc(JSON.stringify(p))+')">Edit</button>':'')+'</div></article>';
   return html;
@@ -1637,7 +1589,8 @@ function closeMarkdownEditor(){$("markdownModal").classList.remove("show");S.mar
 function previewMarkdown(){$("markdownPreview").innerHTML=renderMarkdown($("markdownContent").value);$("markdownPreview").style.display="block";}
 async function saveMarkdown(){if(!S.markdown)return;const m=S.markdown;const url=m.type==="report"?"/api/reports/"+encodeURIComponent(m.id):"/api/topics/"+m.id+"/review";const r=await fetch(url,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({content:$("markdownContent").value,base_version:m.version})});const d=await r.json();if(!r.ok){alert(d.error||"Save failed");return;}closeMarkdownEditor();if(m.type==="report")openReport(m.id);else pollTopicReview();}
 async function renameTopic(){const t=S.topics.find(x=>x.id===S.activeTopic);if(!t)return;const name=prompt("Topic name",t.name);if(!name||name===t.name)return;const r=await fetch("/api/topics/"+t.id,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,base_version:t.version||1})});const d=await r.json();if(!r.ok){alert(d.error||"Rename failed");return;}await loadTopics();await openTopic(t.id);}
-loadSession().then(()=>Promise.all([facets(),loadLLMConfig(),loadTopics()])).then(()=>load());
+$("admin-password").addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();login();}});
+loadSession().then(authenticated=>{if(authenticated)return loadAuthenticated();}).catch(()=>{$("loginError").textContent="Could not connect to PaperLab. Please reload the page.";document.body.classList.add("login-gate");});
 </script>
 </body>
 </html>

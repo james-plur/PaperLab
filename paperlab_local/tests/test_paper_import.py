@@ -8,7 +8,8 @@ from unittest.mock import patch
 import pymupdf
 
 from paperlab_local.paper_import import (
-    ImportError, MAX_PDF_BYTES, cleanup_previews, finalize_import, preview_pdf,
+    ImportError, MAX_PDF_BYTES, cleanup_previews, finalize_batch, finalize_import,
+    parse_bibtex, preview_pdf, preview_pdf_url,
 )
 from paperlab_local.store import Store
 
@@ -100,6 +101,37 @@ class PaperImportTests(unittest.TestCase):
         os.utime(path, (old, old))
         cleanup_previews(self.db)
         self.assertFalse(path.exists())
+
+    def test_bibtex_parses_multiple_entries_and_optional_pdf(self):
+        records = parse_bibtex("""
+        @inproceedings{x, title={Fast {LLM} Serving}, author={Doe, Jane and Roe, John},
+          booktitle={OSDI}, year={2025}, doi={10.1/example}}
+        @article{y, title={Second Paper}, journal={TMLR}, year={2024},
+          eprint={2401.01234}, archivePrefix={arXiv}}
+        """)
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["authors"], "Doe, Jane, Roe, John")
+        self.assertEqual(records[1]["arxiv_id"], "2401.01234")
+        self.assertIsNone(records[1]["pdf_url"])
+
+    def test_pdf_url_rejects_private_address(self):
+        with patch("paperlab_local.paper_import.socket.getaddrinfo",
+                   return_value=[(2, 1, 6, "", ("127.0.0.1", 443))]):
+            with self.assertRaisesRegex(ImportError, "private or local"):
+                preview_pdf_url(self.db, "https://example.test/paper.pdf")
+
+    def test_batch_merges_duplicate_and_updates_higher_citations(self):
+        with Store(self.db, backup_on_migrate=False) as store:
+            paper_id = store.upsert_candidate({"title": "Known Paper", "citation_count": 2})
+        result = finalize_batch(self.db, self.root, [{
+            "fields": {"title": "Known Paper", "organizations": "OpenAI"},
+            "citation_count": 20,
+        }])
+        self.assertEqual(len(result["merged"]), 1)
+        with Store(self.db, backup_on_migrate=False) as store:
+            paper = store.get(paper_id)
+            self.assertEqual(paper["organizations"], "OpenAI")
+            self.assertEqual(paper["citation_count"], 20)
 
 
 if __name__ == "__main__":

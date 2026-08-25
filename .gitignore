@@ -45,3 +45,9 @@ paperlab_local/topics.yaml
 paperlab_publish/topics.yaml
 topics.smoke.yaml
 topics.kvcache.yaml
+
+# local backup files
+*.bak-*
+
+# generated reading notes
+reading-notes/

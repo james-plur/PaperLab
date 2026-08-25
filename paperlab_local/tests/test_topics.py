@@ -47,18 +47,16 @@ class TopicStoreTests(unittest.TestCase):
 
 
 class TopicReviewTests(unittest.TestCase):
-    def test_existing_reports_are_combined_and_persisted(self):
+    def test_abstracts_and_summaries_are_combined_and_persisted(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             cfg = SimpleNamespace(db_path=root / "papers.db", pdf_root=root)
             pdf = root / "paper.pdf"
             pdf.write_bytes(b"%PDF-1.4\n" + b"0" * 1200)
-            report = root / "single.md"
-            report.write_text("# Single report\nmethod details", encoding="utf-8")
             with Store(cfg.db_path, backup_on_migrate=False) as store:
-                pid = store.upsert_candidate({"title": "Early Work", "year": 2020})
+                pid = store.upsert_candidate({"title": "Early Work", "year": 2020, "abstract": "abstract method details"})
                 store.set_pdf(pid, path=str(pdf), status="ok")
-                store.set_report(pid, report_path=str(report))
+                store.set_summary(pid, content="中文概要内容", abstract_hash="test")
                 topic = store.create_collection_topic("Caching")
                 store.add_paper_to_collection(topic["id"], pid)
                 with patch("paperlab_local.report.chat_text", return_value="# Caching\n\n## 核心问题\n...") as chat:
@@ -69,7 +67,8 @@ class TopicReviewTests(unittest.TestCase):
                 self.assertEqual(review["snapshot_hash"], topic_snapshot_hash([pid]))
                 prompt = chat.call_args.args[1]
                 self.assertIn("Early Work", prompt)
-                self.assertIn("method details", prompt)
+                self.assertIn("abstract method details", prompt)
+                self.assertIn("中文概要内容", prompt)
 
     def test_empty_topic_is_rejected(self):
         with tempfile.TemporaryDirectory() as td:
@@ -80,7 +79,7 @@ class TopicReviewTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "no papers"):
                     generate_topic_review(store, cfg, topic["id"])
 
-    def test_missing_report_is_rejected_without_generation(self):
+    def test_missing_summary_still_allows_generation_from_metadata(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             cfg = SimpleNamespace(db_path=root / "papers.db", pdf_root=root)
@@ -88,12 +87,10 @@ class TopicReviewTests(unittest.TestCase):
                 pid = store.upsert_candidate({"title": "Needs Report", "year": 2024})
                 topic = store.create_collection_topic("Incomplete")
                 store.add_paper_to_collection(topic["id"], pid)
-                with patch("paperlab_local.report.generate_report") as generate, \
-                     patch("paperlab_local.report.chat_text") as chat:
-                    with self.assertRaisesRegex(ValueError, "missing reports"):
-                        generate_topic_review(store, cfg, topic["id"])
-                generate.assert_not_called()
-                chat.assert_not_called()
+                with patch("paperlab_local.report.chat_text", return_value="# Incomplete") as chat:
+                    path = generate_topic_review(store, cfg, topic["id"])
+                self.assertTrue(Path(path).is_file())
+                self.assertIn("Needs Report", chat.call_args.args[1])
 
 
 if __name__ == "__main__":

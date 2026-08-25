@@ -42,6 +42,14 @@ def build_parser() -> argparse.ArgumentParser:
     auth = sub.add_parser("auth", help="authentication utilities")
     auth_sub = auth.add_subparsers(dest="auth_action", required=True)
     auth_sub.add_parser("hash-password")
+    devices = sub.add_parser("devices", help="provision synchronization devices")
+    device_sub = devices.add_subparsers(dest="device_action", required=True)
+    create = device_sub.add_parser("create")
+    create.add_argument("name")
+    create.add_argument("--id")
+    revoke = device_sub.add_parser("revoke")
+    revoke.add_argument("device_id")
+    device_sub.add_parser("list")
     return parser
 
 
@@ -59,6 +67,25 @@ def main(argv=None) -> int:
         print(hash_password(first))
         return 0
     cfg = load_config(config_path)
+    if args.command == "devices":
+        import secrets, time
+        from .auth import AuthManager
+        from .store import Store
+        with Store(cfg.db_path, backup_on_migrate=False) as store:
+            if args.device_action == "create":
+                device_id = args.id or secrets.token_hex(8)
+                token = secrets.token_urlsafe(32)
+                store.register_device(device_id, args.name, AuthManager.token_hash(token))
+                print(f"device_id={device_id}\ntoken={token}")
+            elif args.device_action == "revoke":
+                result = store.conn.execute(
+                    "UPDATE sync_devices SET revoked_at=? WHERE device_id=? AND revoked_at IS NULL",
+                    (time.time(), args.device_id))
+                store.conn.commit(); print("revoked" if result.rowcount else "not found")
+            else:
+                for row in store.conn.execute("SELECT device_id,name,created_at,last_seen,revoked_at FROM sync_devices ORDER BY created_at"):
+                    print("\t".join(str(value or "") for value in row))
+        return 0
     serve(cfg.db_path, host=getattr(args, "host", "127.0.0.1"),
           port=getattr(args, "port", 8765), config_path=config_path)
     return 0

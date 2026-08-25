@@ -1,6 +1,8 @@
 # PaperLab Publish
 
-PaperLab Publish is the independently deployable public web and sync service.
+PaperLab Publish is the independently deployable authenticated read-only browser and sync service.
+Browser sessions can view papers, PDFs, Chinese summaries, notes, and Topics, but cannot
+change them. All content changes arrive through authenticated device synchronization.
 Anonymous users have read-only access; authenticated administrators can edit,
 generate content, and resolve conflicts.
 

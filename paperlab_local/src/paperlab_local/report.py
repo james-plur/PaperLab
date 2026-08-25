@@ -121,7 +121,7 @@ def generate_report(store, cfg, paper_id: str, *, provider=None, model=None, log
 
 
 _TOPIC_REVIEW_SYS = """You are a senior research scientist writing a Chinese literature review.
-Use only the supplied paper metadata and deep-read reports. Do not invent facts.
+Use only the supplied paper metadata, abstracts, and Chinese summaries. Do not invent facts.
 Start with a top-level heading containing the topic name. Then write:
 ## 核心问题: identify and explain the central research problems shared by these papers.
 ## 发展脉络: organize the evolution around those core problems, chronologically. Every
@@ -141,7 +141,7 @@ def topic_review_path_for(cfg, topic_id: int) -> Path:
 
 def generate_topic_review(store, cfg, topic_id: int, *, provider=None, model=None,
                           log=print) -> str:
-    """Generate a persisted review only when every member report already exists."""
+    """Generate a persisted review from metadata, abstracts, and optional summaries."""
 
     topic = store.get_collection_topic(topic_id)
     if topic is None:
@@ -153,24 +153,15 @@ def generate_topic_review(store, cfg, topic_id: int, *, provider=None, model=Non
     snapshot = topic_snapshot_hash(paper_ids)
     total = len(papers)
     report_inputs = []
-    missing = []
     for index, paper in enumerate(papers):
         paper_id = paper["id"]
-        existing = store.get_report(paper_id)
-        report_path = Path(existing["report_path"]) if existing and existing["report_path"] else None
-        if not existing or existing["status"] != "ok" or not report_path or not report_path.is_file():
-            missing.append(paper["title"])
-            continue
+        summary = store.get_summary(paper_id)
         report_inputs.append(
             f"## Paper {index + 1}\nTitle: {paper['title']}\nYear: {paper['year'] or 'unknown'}\n"
             f"Authors: {paper['authors'] or ''}\nVenue: {paper['venue'] or ''}\n\n"
-            f"Deep-read report:\n{report_path.read_text(encoding='utf-8')}"
+            f"Abstract:\n{paper['abstract'] or '(not available)'}\n\n"
+            f"Chinese summary:\n{summary['content'] if summary and summary['status'] == 'ok' else '(not generated)'}"
         )
-    if missing:
-        names = "; ".join(missing[:10])
-        if len(missing) > 10:
-            names += f"; and {len(missing) - 10} more"
-        raise ValueError(f"missing reports for {len(missing)} paper(s): {names}")
 
     store.set_topic_review(topic_id, status="running", stage="generating review",
                            completed_papers=total, total_papers=total, snapshot_hash=snapshot)
