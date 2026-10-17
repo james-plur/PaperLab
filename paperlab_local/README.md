@@ -14,8 +14,10 @@ python -m venv .venv
 cp topics.example.yaml topics.yaml
 ```
 
-Configure `PAPERLAB_SYNC_URL`, `PAPERLAB_DEVICE_ID`, and
-`PAPERLAB_DEVICE_TOKEN` to synchronize with PaperLab Publish.
+SSH is the default sync transport. Configure `PAPERLAB_SSH_HOST`,
+`PAPERLAB_DEVICE_ID`, and `PAPERLAB_DEVICE_TOKEN` in the `.env` beside your
+`topics.yaml`. See [SSH sync configuration](../docs/ssh-sync.md) for host-key
+setup, automatic retry and the explicit HTTPS alternative.
 
 PaperLab.app can import papers from uploaded PDFs, public PDF URLs, or BibTeX.
 Related-paper discovery uses OpenAlex and falls back to Semantic Scholar; set

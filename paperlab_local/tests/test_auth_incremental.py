@@ -189,6 +189,7 @@ class AuthWebTests(unittest.TestCase):
         cfg = SimpleNamespace(root=local_root, db_path=local_db, pdf_root=local_root)
         sync_env = patch.dict(os.environ, {
             "PAPERLAB_SYNC_URL": self.url,
+            "PAPERLAB_SYNC_TRANSPORT": "https",
             "PAPERLAB_DEVICE_TOKEN": token,
             "PAPERLAB_DEVICE_ID": "mac",
             "PAPERLAB_SYNC_SERVER": "0",

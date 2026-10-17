@@ -1038,7 +1038,6 @@ class PaperHandler(BaseHTTPRequestHandler):
                 data = self._read_json(5 * 1024 * 1024 + 4096)
                 import urllib.parse as ul
                 from .config import load_config
-                from .reader import save_note
                 from .store import Store
                 paper_id = ul.unquote(note_match.group(1))
                 content = data.get("content")
@@ -1050,14 +1049,12 @@ class PaperHandler(BaseHTTPRequestHandler):
                 with Store(str(self.db_path), backup_on_migrate=False) as store:
                     if not store.get(paper_id):
                         self._send_json({"error": "paper not found"}, 404); return
-                    current = store.get_note(paper_id)
-                    current_version = int(current["version"]) if current else 0
-                    if data.get("base_version") is not None and int(data["base_version"]) != current_version:
-                        self._send_json({"error": "version conflict", "current_version": current_version}, 409); return
-                path = save_note(cfg.pdf_root, paper_id, content)
-                with Store(str(self.db_path), backup_on_migrate=False) as store:
-                    note = store.set_note(paper_id, note_path=str(path), content=content,
-                                          base_version=current_version)
+                    try:
+                        note = store.save_note_content(cfg.pdf_root, paper_id, content,
+                                                       base_version=data.get("base_version"))
+                    except RuntimeError:
+                        self._send_json({"error": "version conflict"}, 409); return
+                    path = Path(note["note_path"])
                     store.record_activity(paper_id, "note_updated", dedupe_seconds=300)
                 self._send_json({"status": "ok", "paper_id": paper_id,
                                  "version": int(note["version"]), "path": str(path)})
@@ -1298,7 +1295,6 @@ class PaperHandler(BaseHTTPRequestHandler):
                     return
                 cfg = load_config(str(self.config_path))
                 if reading_match.group(2) in {"reading-note", "note"}:
-                    from .reader import save_note
                     content = data.get("content")
                     if not isinstance(content, str):
                         self._send_json({"error": "content must be a string"}, 400)
@@ -1307,16 +1303,10 @@ class PaperHandler(BaseHTTPRequestHandler):
                         self._send_json({"error": "note exceeds 5 MB sync limit"}, 413)
                         return
                     with Store(str(self.db_path), backup_on_migrate=False) as store:
-                        current_note = store.get_note(paper_id)
-                        current_version = int(current_note["version"]) if current_note else 0
-                    if data.get("base_version") is not None and int(data["base_version"]) != current_version:
-                        self._send_json({"error": "version conflict", "current_version": current_version}, 409)
-                        return
-                    path = save_note(cfg.pdf_root, paper_id, content)
-                    with Store(str(self.db_path), backup_on_migrate=False) as store:
                         try:
-                            note = store.set_note(paper_id, note_path=str(path), content=content,
-                                                  base_version=data.get("base_version"))
+                            note = store.save_note_content(cfg.pdf_root, paper_id, content,
+                                                           base_version=data.get("base_version"))
+                            path = Path(note["note_path"])
                         except RuntimeError:
                             self._send_json({"error": "version conflict"}, 409)
                             return
@@ -1710,7 +1700,8 @@ def serve(db_path, host="127.0.0.1", port=0, config_path=None, *, app_token):
         store.conn.commit()
         store.run_sync_maintenance()
     auto_sync = os.environ.get("PAPERLAB_AUTO_SYNC", "1").lower() not in {"0", "false", "no", "off"}
-    if auto_sync and os.environ.get("PAPERLAB_SYNC_URL") and os.environ.get("PAPERLAB_DEVICE_TOKEN"):
+    from .transport import sync_configured
+    if auto_sync and sync_configured():
         def sync_loop():
             from .config import load_config
             from .incremental import sync_now
@@ -1733,9 +1724,20 @@ def serve(db_path, host="127.0.0.1", port=0, config_path=None, *, app_token):
     print("PAPERLAB_READY " + json.dumps({"host": host, "port": actual_port,
                                            "app_mode": bool(app_token)}), flush=True)
     print("PaperLab Web: http://{}:{} ({})".format(host, actual_port, db_path), flush=True)
+    import signal
+    previous_sigterm = None
+    if threading.current_thread() is threading.main_thread():
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        def terminate(signum, frame):
+            raise SystemExit(128 + signum)
+        signal.signal(signal.SIGTERM, terminate)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
+        from .transport import close_sync_tunnels
+        close_sync_tunnels()
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)

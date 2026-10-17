@@ -18,3 +18,7 @@ npm run package:mac
 Artifacts are written to `release/`. The first launch looks for
 `~/tools/paperlab/topics.yaml`; if it is not present, PaperLab asks the user to
 select a configuration file.
+
+Synchronization uses managed SSH tunnels by default; see
+[SSH sync configuration](../docs/ssh-sync.md). Rebuild the application to include
+updated sidecar code. Existing installed applications retain their bundled version.

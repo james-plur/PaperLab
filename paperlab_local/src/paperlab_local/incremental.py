@@ -8,7 +8,6 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
-import requests
 
 from .auth import AuthManager
 from .store import Store
@@ -41,8 +40,49 @@ def _topic(store: Store, sync_id: str):
     return store.conn.execute("SELECT * FROM collection_topics WHERE sync_id=?", (sync_id,)).fetchone()
 
 
+SYNC_ENTITIES = {"paper", "topic", "topic_membership", "paper_topic_score",
+                 "paper_venue", "paper_summary", "note", "review"}
+
+
+def validate_change(change: dict) -> None:
+    if not isinstance(change, dict) or change.get("entity_type") not in SYNC_ENTITIES:
+        raise ValueError("unsupported entity type")
+    if change.get("operation") not in {"create", "update", "delete"}:
+        raise ValueError("unsupported operation")
+    if not isinstance(change.get("entity_id"), str) or not change["entity_id"]:
+        raise ValueError("entity_id is required")
+    if not isinstance(change.get("changed_fields", {}), dict):
+        raise ValueError("changed_fields must be an object")
+    for key in ("base_version", "version"):
+        if key in change and (not isinstance(change[key], int) or isinstance(change[key], bool)
+                              or change[key] < (1 if key == "version" else 0)):
+            raise ValueError("invalid " + key)
+
+
+
+def _paper_field_value(store: Store, row, field):
+    if field != "object_sha256":
+        return row[field] if field in row.keys() else None
+    obj = store.conn.execute("SELECT sha256 FROM stored_objects WHERE storage_path=?",
+                             (row["pdf_path"],)).fetchone()
+    if obj:
+        return obj[0]
+    path = Path(row["pdf_path"]) if row["pdf_path"] else None
+    if path and path.is_file():
+        import hashlib
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    return None
+
+
 def apply_change(store: Store, change: dict, cfg, *, remote=True) -> list[str]:
     """Apply non-conflicting fields and retain both values for conflicts."""
+    if isinstance(change, dict) and change.get("entity_type") == "report":
+        return ["legacy_report_rejected"]
+    validate_change(change)
     entity_type = change["entity_type"]
     entity_id = str(change["entity_id"])
     operation = change["operation"]
@@ -52,9 +92,6 @@ def apply_change(store: Store, change: dict, cfg, *, remote=True) -> list[str]:
     device = str(change.get("device_id") or "remote")
     now = time.time()
     conflicts: list[str] = []
-
-    if entity_type == "report":
-        return ["legacy_report_rejected"]
 
     if entity_type == "paper":
         row = store.get(entity_id)
@@ -68,13 +105,17 @@ def apply_change(store: Store, change: dict, cfg, *, remote=True) -> list[str]:
                    "source_url", "pdf_url", "awards", "venue", "year", "track", "citation_count",
                    "published_date", "metadata_status", "github_url", "target_problem", "core_idea",
                    "figure_kind", "figure_mermaid", "extraction_version", "relevance_score",
-                   "relevance_reason"}
-        updates = {k: v for k, v in fields.items() if k in allowed and k not in overlap}
+                   "relevance_reason", "pdf_status"}
+        updates = {k: v for k, v in fields.items() if k in allowed and k not in overlap and row[k] != v}
+        overlap &= allowed | {"object_sha256"}
         for field in overlap:
+            local_value = _paper_field_value(store, row, field)
+            if local_value == fields[field]:
+                continue
             store.conn.execute(
                 """INSERT INTO sync_conflicts(entity_type,entity_id,field,local_value,remote_value,
                    local_version,remote_version,created_at) VALUES (?,?,?,?,?,?,?,?)""",
-                (entity_type, entity_id, field, json.dumps(row[field], ensure_ascii=False),
+                (entity_type, entity_id, field, json.dumps(local_value, ensure_ascii=False),
                  json.dumps(fields[field], ensure_ascii=False), current, incoming_version, now),
             )
             conflicts.append(field)
@@ -88,7 +129,9 @@ def apply_change(store: Store, change: dict, cfg, *, remote=True) -> list[str]:
                 (*updates.values(), max(current + 1, incoming_version), device, now, entity_id),
             )
         digest = fields.get("object_sha256")
-        if digest:
+        if "object_sha256" in fields and not digest and "object_sha256" not in overlap:
+            store.conn.execute("UPDATE papers SET pdf_path=NULL WHERE id=?", (entity_id,))
+        if digest and "object_sha256" not in overlap:
             obj = store.conn.execute("SELECT storage_path FROM stored_objects WHERE sha256=?", (digest,)).fetchone()
             if obj:
                 store.conn.execute(
@@ -110,7 +153,8 @@ def apply_change(store: Store, change: dict, cfg, *, remote=True) -> list[str]:
                 store.conn.execute("UPDATE collection_topics SET deleted_at=?,version=? WHERE sync_id=?",
                                    (now, max(current, incoming_version), entity_id))
             elif "name" in fields:
-                overlap = "name" in _changed_since(store, entity_type, entity_id, base) and current > base
+                overlap = ("name" in _changed_since(store, entity_type, entity_id, base)
+                           and current > base and row["name"] != fields["name"])
                 if overlap:
                     store.conn.execute(
                         """INSERT INTO sync_conflicts(entity_type,entity_id,field,local_value,remote_value,
@@ -178,6 +222,8 @@ def apply_change(store: Store, change: dict, cfg, *, remote=True) -> list[str]:
             )
 
     elif entity_type == "note" and "content" in fields:
+        if not store.conn.in_transaction:
+            store.conn.execute("BEGIN IMMEDIATE")
         if not store.get(entity_id):
             return conflicts
         from .reader import _note_path
@@ -230,6 +276,8 @@ def apply_change(store: Store, change: dict, cfg, *, remote=True) -> list[str]:
             current = int(row["version"] or 1) if row else 0
         if current > base:
             local = path.read_text(encoding="utf-8") if path.is_file() else ""
+            if local == fields["content"]:
+                return conflicts
             store.conn.execute(
                 """INSERT INTO sync_conflicts(entity_type,entity_id,field,local_value,remote_value,
                    local_version,remote_version,created_at) VALUES (?,?,?,?,?,?,?,?)""",
@@ -264,8 +312,16 @@ def push_to_server(store: Store, changes: list[dict], cfg) -> dict:
     accepted = []
     rejected = []
     for incoming in changes:
-        if incoming.get("entity_type") == "report":
+        if isinstance(incoming, dict) and incoming.get("entity_type") == "report":
             rejected.append({"change_id": incoming.get("change_id"), "error": "legacy_report_rejected"})
+            continue
+        try:
+            validate_change(incoming)
+            if not isinstance(incoming.get("change_id"), str) or not incoming["change_id"]:
+                raise ValueError("change_id is required")
+        except ValueError as exc:
+            rejected.append({"change_id": incoming.get("change_id") if isinstance(incoming, dict) else None,
+                             "error": str(exc)})
             continue
         existing = store.conn.execute(
             "SELECT server_sequence FROM sync_changes WHERE change_id=?", (incoming["change_id"],)
@@ -280,6 +336,7 @@ def push_to_server(store: Store, changes: list[dict], cfg) -> dict:
             incoming.get("changed_fields") or {}, base_version=incoming.get("base_version", 0),
             version=incoming.get("version", 1), device_id=incoming.get("device_id", "remote"),
             server_sequence=sequence, change_id=incoming["change_id"], uploaded=True,
+            created_at=incoming.get("created_at"),
         )
         accepted.append({"change_id": incoming["change_id"], "server_sequence": sequence,
                          "conflicts": conflicts})
@@ -288,14 +345,39 @@ def push_to_server(store: Store, changes: list[dict], cfg) -> dict:
 
 
 def sync_now(cfg, *, log=print) -> dict:
-    base_url = os.environ.get("PAPERLAB_SYNC_URL", "").rstrip("/")
+    import fcntl
+    from .transport import sync_connection
+    lock_path = cfg.root / "data" / "sync.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("another PaperLab sync is already running") from exc
+        try:
+            if not os.environ.get("PAPERLAB_DEVICE_TOKEN"):
+                raise RuntimeError("PAPERLAB_DEVICE_TOKEN is required")
+            with sync_connection() as connection:
+                return _sync_connected(cfg, connection, log=log)
+        except Exception as exc:
+            with Store(cfg.db_path, backup_on_migrate=False) as store:
+                now = time.time()
+                store.conn.execute(
+                    """INSERT INTO sync_runtime(id,last_error,last_attempt) VALUES (1,?,?)
+                       ON CONFLICT(id) DO UPDATE SET last_error=excluded.last_error,
+                       last_attempt=excluded.last_attempt""", (str(exc)[:1000], now))
+                store.conn.commit()
+            raise
+
+
+def _sync_connected(cfg, connection, *, log=print) -> dict:
+    base_url = connection.base_url
+    session = connection.session
     token = os.environ.get("PAPERLAB_DEVICE_TOKEN", "")
     device_id = os.environ.get("PAPERLAB_DEVICE_ID", "local")
-    if not base_url or not token:
-        raise RuntimeError("PAPERLAB_SYNC_URL and PAPERLAB_DEVICE_TOKEN are required")
     headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json"}
     from .protocol import require_compatible
-    handshake_response = requests.get(base_url + "/api/sync/handshake", timeout=30)
+    handshake_response = session.get(base_url + "/api/sync/handshake", timeout=30)
     handshake_response.raise_for_status()
     negotiated_capabilities = require_compatible(handshake_response.json())
     with Store(cfg.db_path, backup_on_migrate=False) as store:
@@ -306,7 +388,7 @@ def sync_now(cfg, *, log=print) -> dict:
         def pull(after):
             total_pulled = 0
             while True:
-                response = requests.get(f"{base_url}/api/sync/pull?after={after}", headers=headers, timeout=60)
+                response = session.get(f"{base_url}/api/sync/pull?after={after}", headers=headers, timeout=60)
                 response.raise_for_status()
                 payload = response.json()
                 for change in payload.get("changes", []):
@@ -316,7 +398,7 @@ def sync_now(cfg, *, log=print) -> dict:
                         digests.extend(x.get("sha256") for x in change_fields.get("objects") or [])
                         for digest in [x for x in digests if x]:
                             if not store.conn.execute("SELECT 1 FROM stored_objects WHERE sha256=?", (digest,)).fetchone():
-                                obj_response = requests.get(f"{base_url}/api/sync/objects/{digest}", headers=headers, timeout=300)
+                                obj_response = session.get(f"{base_url}/api/sync/objects/{digest}", headers=headers, timeout=300)
                                 obj_response.raise_for_status()
                                 object_dir = cfg.root / "data" / "objects"
                                 object_dir.mkdir(parents=True, exist_ok=True)
@@ -338,7 +420,8 @@ def sync_now(cfg, *, log=print) -> dict:
                         store.record_change(change["entity_type"], change["entity_id"], change["operation"],
                                             change.get("changed_fields") or {}, base_version=change.get("base_version", 0),
                                             version=change.get("version", 1), device_id=change.get("device_id", "server"),
-                                            server_sequence=change["server_sequence"], change_id=change["change_id"], uploaded=True)
+                                            server_sequence=change["server_sequence"], change_id=change["change_id"], uploaded=True,
+                                            created_at=change.get("created_at"))
                 total_pulled += len(payload.get("changes", []))
                 after = int(payload.get("latest_sequence", after))
                 store.conn.execute(
@@ -351,63 +434,72 @@ def sync_now(cfg, *, log=print) -> dict:
                     return after, total_pulled
 
         cursor, pulled1 = pull(cursor)
-        # Upload content-addressed objects before changes that reference them.
-        pending = [change_dict(row) for row in store.pending_changes()]
-        required_objects = set()
-        for change in pending:
-            fields = change.get("changed_fields") or {}
-            if fields.get("object_sha256"):
-                required_objects.add(fields["object_sha256"])
-            required_objects.update(x.get("sha256") for x in fields.get("objects") or [] if x.get("sha256"))
-        for obj in store.conn.execute("SELECT * FROM stored_objects WHERE deleted_at IS NULL"):
-            digest = obj["sha256"]
-            if digest not in required_objects:
-                continue
-            head = requests.head(f"{base_url}/api/sync/objects/{digest}", headers=headers, timeout=30)
-            if head.status_code == 404:
-                path = Path(obj["storage_path"])
-                offset = int(head.headers.get("X-Upload-Offset", "0"))
-                total = path.stat().st_size
-                with path.open("rb") as handle:
-                    handle.seek(offset)
-                    while True:
-                        chunk = handle.read(4 * 1024 * 1024)
-                        if not chunk:
-                            break
-                        response = requests.put(
-                            f"{base_url}/api/sync/objects/{digest}", data=chunk,
-                            headers={**headers, "Content-Type": obj["content_type"],
-                                     "X-Upload-Offset": str(offset), "X-Upload-Total": str(total)}, timeout=120)
-                        response.raise_for_status()
-                        offset += len(chunk)
-            elif head.status_code != 200:
-                head.raise_for_status()
         pushed = 0
-        batches = []
-        batch = []
-        batch_bytes = 0
-        for change in pending:
-            change_bytes = len(json.dumps(change, ensure_ascii=False).encode())
-            if batch and (len(batch) >= 500 or batch_bytes + change_bytes > 4 * 1024 * 1024):
-                batches.append(batch); batch = []; batch_bytes = 0
-            batch.append(change); batch_bytes += change_bytes
-        if batch:
-            batches.append(batch)
-        for batch in batches:
-            response = requests.post(base_url + "/api/sync/push", headers=headers,
-                                     json={"changes": batch}, timeout=120)
-            response.raise_for_status()
-            payload = response.json()
-            if payload.get("rejected"):
-                raise RuntimeError("sync server rejected changes: " + json.dumps(payload["rejected"], ensure_ascii=False))
-            for item in payload.get("accepted", []):
-                store.conn.execute("UPDATE sync_changes SET uploaded_at=?,server_sequence=? WHERE change_id=?",
-                                   (time.time(), item["server_sequence"], item["change_id"]))
-                pushed += 1
-            store.conn.commit()
+        while True:
+            # Upload content-addressed objects before changes that reference them.
+            pending = [change_dict(row) for row in store.pending_changes()]
+            if not pending:
+                break
+            required_objects = set()
+            for change in pending:
+                fields = change.get("changed_fields") or {}
+                if fields.get("object_sha256"):
+                    required_objects.add(fields["object_sha256"])
+                required_objects.update(x.get("sha256") for x in fields.get("objects") or [] if x.get("sha256"))
+            for obj in store.conn.execute("SELECT * FROM stored_objects WHERE deleted_at IS NULL"):
+                digest = obj["sha256"]
+                if digest not in required_objects:
+                    continue
+                head = session.head(f"{base_url}/api/sync/objects/{digest}", headers=headers, timeout=30)
+                if head.status_code == 404:
+                    path = Path(obj["storage_path"])
+                    offset = int(head.headers.get("X-Upload-Offset", "0"))
+                    total = path.stat().st_size
+                    with path.open("rb") as handle:
+                        handle.seek(offset)
+                        while True:
+                            chunk = handle.read(4 * 1024 * 1024)
+                            if not chunk:
+                                break
+                            response = session.put(
+                                f"{base_url}/api/sync/objects/{digest}", data=chunk,
+                                headers={**headers, "Content-Type": obj["content_type"],
+                                         "X-Upload-Offset": str(offset), "X-Upload-Total": str(total)}, timeout=120)
+                            response.raise_for_status()
+                            offset += len(chunk)
+                elif head.status_code != 200:
+                    head.raise_for_status()
+            batches = []
+            batch = []
+            batch_bytes = 0
+            for change in pending:
+                change_bytes = len(json.dumps(change, ensure_ascii=False).encode())
+                if batch and (len(batch) >= 500 or batch_bytes + change_bytes > 4 * 1024 * 1024):
+                    batches.append(batch); batch = []; batch_bytes = 0
+                batch.append(change); batch_bytes += change_bytes
+            if batch:
+                batches.append(batch)
+            for batch in batches:
+                response = session.post(base_url + "/api/sync/push", headers=headers,
+                                         json={"changes": batch}, timeout=120)
+                response.raise_for_status()
+                payload = response.json()
+                expected = {change["change_id"] for change in batch}
+                accepted = {item["change_id"] for item in payload.get("accepted", [])}
+                if not accepted <= expected:
+                    raise RuntimeError("sync server acknowledged an unknown change")
+                for item in payload.get("accepted", []):
+                    store.conn.execute("UPDATE sync_changes SET uploaded_at=?,server_sequence=? WHERE change_id=?",
+                                       (time.time(), item["server_sequence"], item["change_id"]))
+                    pushed += 1
+                store.conn.commit()
+                if payload.get("rejected"):
+                    raise RuntimeError("sync server rejected changes: " + json.dumps(payload["rejected"], ensure_ascii=False))
+                if accepted != expected:
+                    raise RuntimeError("sync server did not acknowledge all changes; remaining edits retained")
         cursor, pulled2 = pull(cursor)
     result = {"pulled": pulled1 + pulled2, "pushed": pushed, "cursor": cursor,
-              "capabilities": sorted(negotiated_capabilities)}
+              "capabilities": sorted(negotiated_capabilities), "transport": connection.transport}
     with Store(cfg.db_path, backup_on_migrate=False) as runtime_store:
         runtime_store.conn.execute(
             """INSERT INTO sync_runtime(id,last_success,last_error,last_attempt) VALUES (1,?,NULL,?)

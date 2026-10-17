@@ -370,7 +370,8 @@ class Store:
     def record_change(self, entity_type: str, entity_id: str, operation: str,
                       fields: dict, *, base_version: int = 0, version: int = 1,
                       device_id: str | None = None, server_sequence: int | None = None,
-                      change_id: str | None = None, uploaded: bool = False) -> str:
+                      change_id: str | None = None, uploaded: bool = False,
+                      created_at: float | None = None) -> str:
         """Append an idempotent sync change in the caller's transaction."""
         import uuid
         cid = change_id or str(uuid.uuid4())
@@ -386,7 +387,8 @@ class Store:
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (cid, server_sequence, entity_type, str(entity_id), operation,
              json.dumps(fields, ensure_ascii=False, sort_keys=True), int(base_version),
-             int(version), device, now, now, now if uploaded else None),
+             int(version), device, float(created_at) if created_at is not None else now,
+             now, now if uploaded else None),
         )
         return cid
 
@@ -1102,6 +1104,35 @@ class Store:
         return self.conn.execute(
             "SELECT * FROM paper_notes WHERE paper_id=? AND deleted_at IS NULL", (paper_id,)
         ).fetchone()
+
+    def save_note_content(self, pdf_root: Path, paper_id: str, content: str,
+                          *, base_version: int | None = None) -> sqlite3.Row:
+        from .reader import _note_path, save_note
+        if len(content.encode("utf-8")) > 5 * 1024 * 1024:
+            raise ValueError("note exceeds 5 MB sync limit")
+        self.conn.execute("BEGIN IMMEDIATE")
+        path = _note_path(pdf_root, paper_id)
+        previous = path.read_bytes() if path.is_file() else None
+        wrote = False
+        try:
+            existing = self.get_note(paper_id)
+            current = int(existing["version"]) if existing else 0
+            if base_version is not None and int(base_version) != current:
+                raise RuntimeError("version conflict")
+            save_note(pdf_root, paper_id, content)
+            wrote = True
+            return self.set_note(paper_id, note_path=str(path), content=content,
+                                 base_version=current)
+        except Exception:
+            if wrote:
+                if previous is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    temp = path.with_suffix(".md.restore")
+                    temp.write_bytes(previous)
+                    os.replace(temp, path)
+            self.conn.rollback()
+            raise
 
     def set_note(self, paper_id: str, *, note_path: str, content: str,
                  base_version: int | None = None, track_change: bool = True) -> sqlite3.Row:

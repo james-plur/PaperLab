@@ -41,8 +41,49 @@ def _topic(store: Store, sync_id: str):
     return store.conn.execute("SELECT * FROM collection_topics WHERE sync_id=?", (sync_id,)).fetchone()
 
 
+SYNC_ENTITIES = {"paper", "topic", "topic_membership", "paper_topic_score",
+                 "paper_venue", "paper_summary", "note", "review"}
+
+
+def validate_change(change: dict) -> None:
+    if not isinstance(change, dict) or change.get("entity_type") not in SYNC_ENTITIES:
+        raise ValueError("unsupported entity type")
+    if change.get("operation") not in {"create", "update", "delete"}:
+        raise ValueError("unsupported operation")
+    if not isinstance(change.get("entity_id"), str) or not change["entity_id"]:
+        raise ValueError("entity_id is required")
+    if not isinstance(change.get("changed_fields", {}), dict):
+        raise ValueError("changed_fields must be an object")
+    for key in ("base_version", "version"):
+        if key in change and (not isinstance(change[key], int) or isinstance(change[key], bool)
+                              or change[key] < (1 if key == "version" else 0)):
+            raise ValueError("invalid " + key)
+
+
+
+def _paper_field_value(store: Store, row, field):
+    if field != "object_sha256":
+        return row[field] if field in row.keys() else None
+    obj = store.conn.execute("SELECT sha256 FROM stored_objects WHERE storage_path=?",
+                             (row["pdf_path"],)).fetchone()
+    if obj:
+        return obj[0]
+    path = Path(row["pdf_path"]) if row["pdf_path"] else None
+    if path and path.is_file():
+        import hashlib
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    return None
+
+
 def apply_change(store: Store, change: dict, cfg, *, remote=True) -> list[str]:
     """Apply non-conflicting fields and retain both values for conflicts."""
+    if isinstance(change, dict) and change.get("entity_type") == "report":
+        return ["legacy_report_rejected"]
+    validate_change(change)
     entity_type = change["entity_type"]
     entity_id = str(change["entity_id"])
     operation = change["operation"]
@@ -52,9 +93,6 @@ def apply_change(store: Store, change: dict, cfg, *, remote=True) -> list[str]:
     device = str(change.get("device_id") or "remote")
     now = time.time()
     conflicts: list[str] = []
-
-    if entity_type == "report":
-        return ["legacy_report_rejected"]
 
     if entity_type == "paper":
         row = store.get(entity_id)
@@ -68,13 +106,17 @@ def apply_change(store: Store, change: dict, cfg, *, remote=True) -> list[str]:
                    "source_url", "pdf_url", "awards", "venue", "year", "track", "citation_count",
                    "published_date", "metadata_status", "github_url", "target_problem", "core_idea",
                    "figure_kind", "figure_mermaid", "extraction_version", "relevance_score",
-                   "relevance_reason"}
-        updates = {k: v for k, v in fields.items() if k in allowed and k not in overlap}
+                   "relevance_reason", "pdf_status"}
+        updates = {k: v for k, v in fields.items() if k in allowed and k not in overlap and row[k] != v}
+        overlap &= allowed | {"object_sha256"}
         for field in overlap:
+            local_value = _paper_field_value(store, row, field)
+            if local_value == fields[field]:
+                continue
             store.conn.execute(
                 """INSERT INTO sync_conflicts(entity_type,entity_id,field,local_value,remote_value,
                    local_version,remote_version,created_at) VALUES (?,?,?,?,?,?,?,?)""",
-                (entity_type, entity_id, field, json.dumps(row[field], ensure_ascii=False),
+                (entity_type, entity_id, field, json.dumps(local_value, ensure_ascii=False),
                  json.dumps(fields[field], ensure_ascii=False), current, incoming_version, now),
             )
             conflicts.append(field)
@@ -88,7 +130,9 @@ def apply_change(store: Store, change: dict, cfg, *, remote=True) -> list[str]:
                 (*updates.values(), max(current + 1, incoming_version), device, now, entity_id),
             )
         digest = fields.get("object_sha256")
-        if digest:
+        if "object_sha256" in fields and not digest and "object_sha256" not in overlap:
+            store.conn.execute("UPDATE papers SET pdf_path=NULL WHERE id=?", (entity_id,))
+        if digest and "object_sha256" not in overlap:
             obj = store.conn.execute("SELECT storage_path FROM stored_objects WHERE sha256=?", (digest,)).fetchone()
             if obj:
                 store.conn.execute(
@@ -110,7 +154,8 @@ def apply_change(store: Store, change: dict, cfg, *, remote=True) -> list[str]:
                 store.conn.execute("UPDATE collection_topics SET deleted_at=?,version=? WHERE sync_id=?",
                                    (now, max(current, incoming_version), entity_id))
             elif "name" in fields:
-                overlap = "name" in _changed_since(store, entity_type, entity_id, base) and current > base
+                overlap = ("name" in _changed_since(store, entity_type, entity_id, base)
+                           and current > base and row["name"] != fields["name"])
                 if overlap:
                     store.conn.execute(
                         """INSERT INTO sync_conflicts(entity_type,entity_id,field,local_value,remote_value,
@@ -174,6 +219,8 @@ def apply_change(store: Store, change: dict, cfg, *, remote=True) -> list[str]:
                  fields.get("provider"),fields.get("model"),fields.get("generated_at"),now,incoming_version,device))
 
     elif entity_type == "note" and "content" in fields:
+        if not store.conn.in_transaction:
+            store.conn.execute("BEGIN IMMEDIATE")
         if not store.get(entity_id): return conflicts
         import hashlib, re as _re
         content = str(fields.get("content") or "")
@@ -210,6 +257,8 @@ def apply_change(store: Store, change: dict, cfg, *, remote=True) -> list[str]:
             current = int(row["version"] or 1) if row else 0
         if current > base:
             local = path.read_text(encoding="utf-8") if path.is_file() else ""
+            if local == fields["content"]:
+                return conflicts
             store.conn.execute(
                 """INSERT INTO sync_conflicts(entity_type,entity_id,field,local_value,remote_value,
                    local_version,remote_version,created_at) VALUES (?,?,?,?,?,?,?,?)""",
@@ -244,8 +293,16 @@ def push_to_server(store: Store, changes: list[dict], cfg) -> dict:
     accepted = []
     rejected = []
     for incoming in changes:
-        if incoming.get("entity_type") == "report":
+        if isinstance(incoming, dict) and incoming.get("entity_type") == "report":
             rejected.append({"change_id": incoming.get("change_id"), "error": "legacy_report_rejected"})
+            continue
+        try:
+            validate_change(incoming)
+            if not isinstance(incoming.get("change_id"), str) or not incoming["change_id"]:
+                raise ValueError("change_id is required")
+        except ValueError as exc:
+            rejected.append({"change_id": incoming.get("change_id") if isinstance(incoming, dict) else None,
+                             "error": str(exc)})
             continue
         existing = store.conn.execute(
             "SELECT server_sequence FROM sync_changes WHERE change_id=?", (incoming["change_id"],)
@@ -260,6 +317,7 @@ def push_to_server(store: Store, changes: list[dict], cfg) -> dict:
             incoming.get("changed_fields") or {}, base_version=incoming.get("base_version", 0),
             version=incoming.get("version", 1), device_id=incoming.get("device_id", "remote"),
             server_sequence=sequence, change_id=incoming["change_id"], uploaded=True,
+            created_at=incoming.get("created_at"),
         )
         accepted.append({"change_id": incoming["change_id"], "server_sequence": sequence,
                          "conflicts": conflicts})
@@ -314,7 +372,8 @@ def sync_now(cfg, *, log=print) -> dict:
                         store.record_change(change["entity_type"], change["entity_id"], change["operation"],
                                             change.get("changed_fields") or {}, base_version=change.get("base_version", 0),
                                             version=change.get("version", 1), device_id=change.get("device_id", "server"),
-                                            server_sequence=change["server_sequence"], change_id=change["change_id"], uploaded=True)
+                                            server_sequence=change["server_sequence"], change_id=change["change_id"], uploaded=True,
+                                            created_at=change.get("created_at"))
                 total_pulled += len(payload.get("changes", []))
                 after = int(payload.get("latest_sequence", after))
                 store.conn.execute(

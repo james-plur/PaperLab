@@ -67,7 +67,7 @@ if(!app.requestSingleInstanceLock())app.quit();else{
   app.on("open-url",(event,url)=>{event.preventDefault();openPaper(paperIdFromArgs([url]));});
   app.on("second-instance",(_event,argv)=>{openPaper(paperIdFromArgs(argv));if(mainWindow){if(mainWindow.isMinimized())mainWindow.restore();mainWindow.focus();}});
   app.whenReady().then(()=>{Menu.setApplicationMenu(Menu.buildFromTemplate([{label:"PaperLab",submenu:[{role:"about"},{type:"separator"},{label:"Settings…",accelerator:"CmdOrCtrl+,",click:()=>mainWindow?.webContents.send("paperlab:command","settings")},{type:"separator"},{role:"quit"}]},{label:"Edit",submenu:[{role:"undo"},{role:"redo"},{type:"separator"},{role:"cut"},{role:"copy"},{role:"paste"},{role:"selectAll"}]},{label:"View",submenu:[{role:"reload"},{role:"toggleDevTools"},{type:"separator"},{role:"resetZoom"},{role:"zoomIn"},{role:"zoomOut"}]},{label:"Window",submenu:[{role:"minimize"},{role:"zoom"},{role:"front"}]}]));return createWindow();}).catch(error=>{dialog.showErrorBox("PaperLab could not start",String(error.stack||error));app.quit();});
-  app.on("before-quit",stopBackend);app.on("window-all-closed",()=>app.quit());
+  app.on("will-quit",stopBackend);app.on("window-all-closed",()=>app.quit());
 }
 ipcMain.handle("paperlab:connection",()=>connection);
 ipcMain.handle("paperlab:choose-import",async(_event,kind)=>{const result=await dialog.showOpenDialog({properties:["openFile"],filters:kind==="pdf"?[{name:"PDF",extensions:["pdf"]}]:[{name:"BibTeX",extensions:["bib","bibtex","txt"]}]});if(result.canceled)return null;const file=result.filePaths[0],stat=fs.statSync(file);if(stat.size>50*1024*1024)throw new Error("File exceeds 50 MB");return {name:path.basename(file),data:fs.readFileSync(file).toString("base64")};});

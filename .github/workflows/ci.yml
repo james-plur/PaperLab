@@ -38,6 +38,23 @@ jobs:
       - run: python -m compileall -q "${{ matrix.project }}/src"
       - run: python -m unittest discover -s "${{ matrix.project }}/tests"
 
+  desktop:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: paperlab_app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: paperlab_app/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build:web
+
   reject-runtime-data-and-secrets:
     runs-on: ubuntu-latest
     steps:

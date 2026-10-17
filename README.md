@@ -1,5 +1,8 @@
 # PaperLab monorepo
 
+当前版本：**0.5.0**。默认通过 SSH 隧道进行双向增量同步，详见
+[SSH 同步配置与恢复](docs/ssh-sync.md) 和 [更新记录](CHANGELOG.md)。
+
 本仓库包含两个完全独立、可分别安装和发布的应用：
 
 - [`paperlab_app/`](paperlab_app/)：本地 Mac 的唯一交互入口。

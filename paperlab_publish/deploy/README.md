@@ -14,7 +14,10 @@ Create the password hash with `paperlab-publish auth hash-password`. Create runt
 
 Provision a device on the server with `paperlab-publish --config topics.yaml devices create "MacBook"`.
 Configure the returned one-time token locally as `PAPERLAB_DEVICE_TOKEN`, plus
-`PAPERLAB_SYNC_URL` and a stable `PAPERLAB_DEVICE_ID`. Device creation and revocation are
+`PAPERLAB_SSH_HOST` and a stable `PAPERLAB_DEVICE_ID`. The default SSH transport
+forwards to the backend at `127.0.0.1:8765`, independently of the public gateway.
+See [SSH sync configuration](../../docs/ssh-sync.md). Direct HTTPS requires
+explicit `PAPERLAB_SYNC_TRANSPORT=https` and `PAPERLAB_SYNC_URL`. Device creation and revocation are
 CLI-only; the authenticated browser remains read-only.
 
 Before first sync, migrate a consistent SQLite snapshot and artifact directories while both Web instances are stopped. Verify `PRAGMA integrity_check`, counts, and sample SHA-256 values. Run `deploy/backup.sh` daily; set a private rclone target in `PAPERLAB_BACKUP_REMOTE` for off-server backups.

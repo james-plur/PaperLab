@@ -3,7 +3,7 @@ set -euo pipefail
 APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT_DIR="$(cd "$APP_DIR/.." && pwd)"
 cd "$ROOT_DIR"
-"$ROOT_DIR/.venv/bin/python" -m unittest discover -s paperlab_local/tests -p 'test_*.py'
+"$ROOT_DIR/paperlab_local/.venv/bin/python" -m unittest discover -s paperlab_local/tests -p 'test_*.py'
 cd "$APP_DIR"
 npm run typecheck
 npm test

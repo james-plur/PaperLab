@@ -342,7 +342,8 @@ class Store:
     def record_change(self, entity_type: str, entity_id: str, operation: str,
                       fields: dict, *, base_version: int = 0, version: int = 1,
                       device_id: str | None = None, server_sequence: int | None = None,
-                      change_id: str | None = None, uploaded: bool = False) -> str:
+                      change_id: str | None = None, uploaded: bool = False,
+                      created_at: float | None = None) -> str:
         """Append an idempotent sync change in the caller's transaction."""
         import uuid
         cid = change_id or str(uuid.uuid4())
@@ -358,7 +359,8 @@ class Store:
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (cid, server_sequence, entity_type, str(entity_id), operation,
              json.dumps(fields, ensure_ascii=False, sort_keys=True), int(base_version),
-             int(version), device, now, now, now if uploaded else None),
+             int(version), device, float(created_at) if created_at is not None else now,
+             now, now if uploaded else None),
         )
         return cid
 

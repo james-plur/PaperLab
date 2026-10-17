@@ -1,6 +1,6 @@
 {
   "name": "paperlab-desktop",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "private": true,
   "description": "PaperLab macOS research workbench",
   "main": "electron/main.cjs",
